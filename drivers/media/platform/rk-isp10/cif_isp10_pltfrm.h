@@ -57,7 +57,7 @@ cif_isp10_pltfrm_ftrace_printf(
 
 #define cif_isp10_pltfrm_pr_dbg(dev, fmt, arg...) \
 	do { \
-		pr_debug("%s: " fmt, \
+		pr_info("%s: " fmt, \
 			__func__, ## arg); \
 		cif_isp10_pltfrm_ftrace_printf(dev, "%s: " fmt, \
 			__func__, ## arg); \
@@ -199,6 +199,9 @@ int cif_isp10_pltfrm_soc_init(
 	struct pltfrm_soc_cfg *soc_cfg);
 
 int cif_isp10_pltfrm_mipi_dphy_config(
+	struct cif_isp10_device *cif_isp10_dev);
+
+int cif_isp10_pltfrm_reset(
 	struct cif_isp10_device *cif_isp10_dev);
 
 #endif

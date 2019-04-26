@@ -91,8 +91,43 @@
  *3. support VIDIOC_G_PARM command.
  *4. support VIDIOC_G_PARM command.
  *5. add pix.bytesperline and pix.sizeimage in VIDIOC_G_FMT command.
+ *
+ *v0.1.0xd
+ *1. Support RGB24(xRGB8888) format of SP Path.
+ *
+ *v0.1.0xe
+ *1. fix owned_by_drv_count is not 0 when stop stream.
+ *2. fix write fmt is not correct when setting mi_ctrl.
+ *3. modify for dumpsys tool.
+ *4. remove "Measurement late" check.
+ *5. modify for af function.
+ *6. add module parameter for dumpsys.
+ *
+ *v0.1.0xf
+ *1. merge modification from rv1108 project.
+ *
+ *v0.2.0x0
+ *1. fix compile warning.
+ *2. add check of iommu status.
+ *3. support stream on/off/on/off...
+ *4. get correct isp out width/height.
+ *5. fix the issue that setting of isp0 mipi affect txrx dphy.
+ *6. fix the issue cannot set exposure by mp path device.
+ *
+ *v0.2.0x1
+ *1. add isp reset function.
+ *2. fix the issue that setting of isp0 mipi affect txrx dphy.
+ *
+ *v0.2.0x2
+ *1. fix fmt selection.
+ *2. MP/SP burst config with resolution.
+ *3. fix one vb is in queue.done_list twice.
+ *4. fix lose buffer in qduf ioctl.
+ *5. fix AE information is not correct when updating exposure by each frame.
+ *6. support Y8/Y12 grey sensor.
+ *
  */
 
-#define CONFIG_CIFISP10_DRIVER_VERSION KERNEL_VERSION(0, 1, 0xc)
+#define CONFIG_CIFISP10_DRIVER_VERSION KERNEL_VERSION(0, 2, 0x2)
 
 #endif
