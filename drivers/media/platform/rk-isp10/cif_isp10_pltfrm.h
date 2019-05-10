@@ -57,7 +57,7 @@ cif_isp10_pltfrm_ftrace_printf(
 
 #define cif_isp10_pltfrm_pr_dbg(dev, fmt, arg...) \
 	do { \
-		pr_info("%s: " fmt, \
+		pr_debug("%s: " fmt, \
 			__func__, ## arg); \
 		cif_isp10_pltfrm_ftrace_printf(dev, "%s: " fmt, \
 			__func__, ## arg); \
