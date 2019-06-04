@@ -3183,8 +3183,8 @@ static void goodix_ts_exit(void)
         destroy_workqueue(goodix_wq);
     }
 }
-//late_initcall(goodix_ts_init);
-module_init(goodix_ts_init);
+late_initcall(goodix_ts_init);
+//module_init(goodix_ts_init);
 
 module_exit(goodix_ts_exit);
 
