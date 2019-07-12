@@ -312,7 +312,7 @@
     	max-x = <800>;
     	max-y = <1280>;
     	tp-size = <101>;   // <911> for 8 inch // <101> for 10 inch
-    	status = "disable";
+    	status = "okay";
 	}; 
 	camera0: camera-module@10 {
 		status = "okay";
