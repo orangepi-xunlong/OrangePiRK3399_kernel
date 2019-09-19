@@ -110,6 +110,7 @@ struct ov13850_mode {
 struct ov13850 {
 	struct i2c_client	*client;
 	struct clk		*xvclk;
+	struct gpio_desc	*pwr_gpio;
 	struct gpio_desc	*reset_gpio;
 	struct gpio_desc	*pwdn_gpio;
 	struct regulator_bulk_data supplies[OV13850_NUM_SUPPLIES];
@@ -1097,6 +1098,10 @@ static int __ov13850_power_on(struct ov13850 *ov13850)
 		return ret;
 	}
 
+	if (!IS_ERR(ov13850->pwr_gpio))
+		gpiod_set_value_cansleep(ov13850->pwr_gpio, 1);
+	usleep_range(500, 1000);
+
 	if (!IS_ERR(ov13850->reset_gpio))
 		gpiod_set_value_cansleep(ov13850->reset_gpio, 0);
 
@@ -1141,6 +1146,8 @@ static void __ov13850_power_off(struct ov13850 *ov13850)
 		if (ret < 0)
 			dev_dbg(dev, "could not set pins\n");
 	}
+	if (!IS_ERR(ov13850->pwr_gpio))
+		gpiod_set_value_cansleep(ov13850->pwr_gpio, 0);
 	regulator_bulk_disable(OV13850_NUM_SUPPLIES, ov13850->supplies);
 }
 
@@ -1447,6 +1454,10 @@ static int ov13850_probe(struct i2c_client *client,
 	}
 	if (clk_get_rate(ov13850->xvclk) != OV13850_XVCLK_FREQ)
 		dev_warn(dev, "xvclk mismatched, modes are based on 24MHz\n");
+
+	ov13850->pwr_gpio = devm_gpiod_get(dev, "pwr", GPIOD_OUT_LOW);
+	if (IS_ERR(ov13850->pwr_gpio))
+		dev_warn(dev, "Failed to get pwr-gpios\n");
 
 	ov13850->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(ov13850->reset_gpio))
