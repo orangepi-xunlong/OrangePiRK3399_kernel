@@ -58,7 +58,17 @@
 		nvmem-cell-names = "id";
 	};
 
-
+  vcc3v3_pcie: vcc3v3-pcie-regulator {
+    compatible = "regulator-fixed";
+    enable-active-high;
+    regulator-always-on;
+    regulator-boot-on;
+    gpio = <&gpio1 0 GPIO_ACTIVE_HIGH>;
+//    gpio = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+    pinctrl-names = "default";
+    pinctrl-0 = <&pcie_drv>;
+    regulator-name = "vcc3v3_pcie";
+	};
 	aliases {
 		spi1 = &spi1;
 	};
@@ -496,7 +506,7 @@
 };
 
 &spi1 {
-	status = "disabled";
+	status = "okay";
 	pinctrl-names = "default", "sleep";
 	pinctrl-1 = <&spi1_gpio>;
 
@@ -507,6 +517,17 @@
 		status = "okay";
 	};
 };
+/*
+&spi1 {
+    status = "okay";
+    max-freq = <48000000>;
+    spidev@00 {
+        compatible = "linux,spidev";
+        reg = <0x00>;
+        spi-max-frequency = <48000000>;
+    };
+};
+*/
 
 &uart0 {
 	pinctrl-names = "default";
@@ -519,7 +540,7 @@
 };
 
 &uart4 {
-	status = "okay";
+	status = "disable";
 };
 
 &vopb {
@@ -578,7 +599,7 @@
 	status = "disabled";
 };
 */
-&route_edp {
+&route_dsi {
 	status = "okay";
 	logo,mode = "center";
 };
@@ -938,14 +959,14 @@
 };
 
 &pcie_phy {
-	status = "disable";
+	status = "okay";
 	assigned-clocks = <&cru SCLK_PCIEPHY_REF>;
 	assigned-clock-parents = <&cru SCLK_PCIEPHY_REF100M>;
 	assigned-clock-rates = <100000000>;
 };
 
 &pcie0 {
-	status = "disable";
+	status = "okay";
 	ep-gpios = <&gpio2 4 GPIO_ACTIVE_HIGH>;
 	num-lanes = <4>;
 	max-link-speed = <2>;
@@ -1134,6 +1155,13 @@
 	edp {
 		/delete-node/ edp-hpd;
 	};
+
+  pcie {
+    pcie_drv: pcie-drv {
+      rockchip,pins =
+        <1 0 RK_FUNC_GPIO &pcfg_pull_none>;
+      };
+  };
 
 	hdmi {
 		/delete-node/ hdmi-i2c-xfer;
