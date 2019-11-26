@@ -1052,6 +1052,10 @@ static int tc_camera_module_i2c_write(struct v4l2_subdev *sd, u16 reg,
 		msg->flags = I2C_M_WR;
 		msg->len = 2 + len;
 		msg->buf = data;
+                if(retries > 2){
+                        client->addr = 0x1f;
+                        msg->addr = 0x1f;
+                }	
 
 		/* high byte goes out first */
 		data[0] = (u8)(reg >> 8);

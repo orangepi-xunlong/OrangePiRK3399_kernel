@@ -527,8 +527,8 @@ int tc358749xbg_s_power(struct tc_camera_module *cam_mod, bool enable)
 				  enable);
 
 	if (enable) {
-		gpiod_direction_output(tc358749xbg_priv.gpio_reset, 0);
 		gpiod_direction_output(tc358749xbg_priv.gpio_int, 0);
+		gpiod_direction_output(tc358749xbg_priv.gpio_reset, 0);
 		gpiod_direction_output(tc358749xbg_priv.gpio_stanby, 0);
 		gpiod_direction_output(tc358749xbg_priv.gpio_power18, 1);
 		gpiod_direction_output(tc358749xbg_priv.gpio_power33, 1);
@@ -538,7 +538,7 @@ int tc358749xbg_s_power(struct tc_camera_module *cam_mod, bool enable)
 	} else {
 		gpiod_direction_output(tc358749xbg_priv.gpio_power, 0);
 		gpiod_direction_output(tc358749xbg_priv.gpio_reset, 1);
-		gpiod_direction_output(tc358749xbg_priv.gpio_reset, 0);
+	//	gpiod_direction_output(tc358749xbg_priv.gpio_reset, 0);
 	}
 
 	return 0;
