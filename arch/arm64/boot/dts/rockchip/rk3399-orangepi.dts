@@ -506,7 +506,7 @@
 };
 
 &spi1 {
-	status = "okay";
+	status = "disable";
 	pinctrl-names = "default", "sleep";
 	pinctrl-1 = <&spi1_gpio>;
 
@@ -540,7 +540,7 @@
 };
 
 &uart4 {
-	status = "disable";
+	status = "okay";
 };
 
 &vopb {
