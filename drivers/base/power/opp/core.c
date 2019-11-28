@@ -704,15 +704,15 @@ restore_voltage:
 EXPORT_SYMBOL_GPL(dev_pm_opp_set_rate);
 
 /**
- * dev_pm_opp_check_initial_rate() - Configure new OPP based on initial rate
+ * dev_pm_opp_check_rate_volt() - Configure new OPP based on current rate
  * @dev:	 device for which we do this operation
  *
  * This configures the power-supplies and clock source to the levels specified
- * by the OPP corresponding to the system initial rate.
+ * by the OPP corresponding to current rate.
  *
  * Locking: This function takes rcu_read_lock().
  */
-int dev_pm_opp_check_initial_rate(struct device *dev, unsigned long *cur_freq)
+int dev_pm_opp_check_rate_volt(struct device *dev, bool force)
 {
 	struct opp_table *opp_table;
 	struct dev_pm_opp *opp;
@@ -741,7 +741,6 @@ int dev_pm_opp_check_initial_rate(struct device *dev, unsigned long *cur_freq)
 	}
 
 	old_freq = clk_get_rate(clk);
-	*cur_freq = old_freq;
 	target_freq = old_freq;
 
 	opp = dev_pm_opp_find_freq_ceil(dev, &target_freq);
@@ -771,15 +770,15 @@ int dev_pm_opp_check_initial_rate(struct device *dev, unsigned long *cur_freq)
 	dev_dbg(dev, "%lu Hz %d uV --> %lu Hz %lu uV\n", old_freq, old_volt,
 		target_freq, u_volt);
 
-	if (old_freq == target_freq && old_volt == u_volt)
-		return 0;
-
-	if (old_freq == target_freq && old_volt != u_volt) {
-		ret = _set_opp_voltage(dev, reg, u_volt, u_volt_min,
-				       u_volt_max);
-		if (ret) {
-			dev_err(dev, "failed to set volt %lu\n", u_volt);
-			return ret;
+	if (old_freq == target_freq) {
+		if (old_volt != u_volt || force) {
+			ret = _set_opp_voltage(dev, reg, u_volt, u_volt_min,
+					u_volt_max);
+			if (ret) {
+				dev_err(dev, "failed to set volt %lu\n",
+					u_volt);
+				return ret;
+			}
 		}
 		return 0;
 	}
@@ -801,8 +800,6 @@ int dev_pm_opp_check_initial_rate(struct device *dev, unsigned long *cur_freq)
 		return ret;
 	}
 
-	*cur_freq = clk_get_rate(clk);
-
 	/* Scaling down? Scale voltage after frequency */
 	if (target_freq < old_freq) {
 		ret = _set_opp_voltage(dev, reg, u_volt, u_volt_min,
@@ -815,7 +812,7 @@ int dev_pm_opp_check_initial_rate(struct device *dev, unsigned long *cur_freq)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(dev_pm_opp_check_initial_rate);
+EXPORT_SYMBOL_GPL(dev_pm_opp_check_rate_volt);
 
 /* OPP-dev Helpers */
 static void _kfree_opp_dev_rcu(struct rcu_head *head)
@@ -1926,29 +1923,63 @@ int dev_pm_opp_disable(struct device *dev, unsigned long freq)
 EXPORT_SYMBOL_GPL(dev_pm_opp_disable);
 
 /**
- * dev_pm_opp_get_notifier() - find notifier_head of the device with opp
- * @dev:	device pointer used to lookup OPP table.
+ * dev_pm_opp_register_notifier() - Register OPP notifier for the device
+ * @dev:	Device for which notifier needs to be registered
+ * @nb:		Notifier block to be registered
  *
- * Return: pointer to  notifier head if found, otherwise -ENODEV or
- * -EINVAL based on type of error casted as pointer. value must be checked
- *  with IS_ERR to determine valid pointer or error result.
- *
- * Locking: This function must be called under rcu_read_lock(). opp_table is a
- * RCU protected pointer. The reason for the same is that the opp pointer which
- * is returned will remain valid for use with opp_get_{voltage, freq} only while
- * under the locked area. The pointer returned must be used prior to unlocking
- * with rcu_read_unlock() to maintain the integrity of the pointer.
+ * Return: 0 on success or a negative error value.
  */
-struct srcu_notifier_head *dev_pm_opp_get_notifier(struct device *dev)
+int dev_pm_opp_register_notifier(struct device *dev, struct notifier_block *nb)
 {
-	struct opp_table *opp_table = _find_opp_table(dev);
+	struct opp_table *opp_table;
+	int ret;
 
-	if (IS_ERR(opp_table))
-		return ERR_CAST(opp_table); /* matching type */
+	rcu_read_lock();
 
-	return &opp_table->srcu_head;
+	opp_table = _find_opp_table(dev);
+	if (IS_ERR(opp_table)) {
+		ret = PTR_ERR(opp_table);
+		goto unlock;
+	}
+
+	ret = srcu_notifier_chain_register(&opp_table->srcu_head, nb);
+
+unlock:
+	rcu_read_unlock();
+
+	return ret;
 }
-EXPORT_SYMBOL_GPL(dev_pm_opp_get_notifier);
+EXPORT_SYMBOL(dev_pm_opp_register_notifier);
+
+/**
+ * dev_pm_opp_unregister_notifier() - Unregister OPP notifier for the device
+ * @dev:	Device for which notifier needs to be unregistered
+ * @nb:		Notifier block to be unregistered
+ *
+ * Return: 0 on success or a negative error value.
+ */
+int dev_pm_opp_unregister_notifier(struct device *dev,
+				   struct notifier_block *nb)
+{
+	struct opp_table *opp_table;
+	int ret;
+
+	rcu_read_lock();
+
+	opp_table = _find_opp_table(dev);
+	if (IS_ERR(opp_table)) {
+		ret = PTR_ERR(opp_table);
+		goto unlock;
+	}
+
+	ret = srcu_notifier_chain_unregister(&opp_table->srcu_head, nb);
+
+unlock:
+	rcu_read_unlock();
+
+	return ret;
+}
+EXPORT_SYMBOL(dev_pm_opp_unregister_notifier);
 
 #ifdef CONFIG_OF
 /**

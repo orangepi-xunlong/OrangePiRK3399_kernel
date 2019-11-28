@@ -133,7 +133,7 @@ static int call_cpuidle(struct cpuidle_driver *drv, struct cpuidle_device *dev,
  */
 static void cpuidle_idle_call(void)
 {
-	struct cpuidle_device *dev = __this_cpu_read(cpuidle_devices);
+	struct cpuidle_device *dev = cpuidle_get_device();
 	struct cpuidle_driver *drv = cpuidle_get_cpu_driver(dev);
 	int next_state, entered_state;
 
@@ -276,7 +276,7 @@ static void cpu_idle_loop(void)
 		smp_mb__after_atomic();
 
 		sched_ttwu_pending();
-		schedule_preempt_disabled();
+		schedule_idle();
 	}
 }
 

@@ -180,6 +180,7 @@ struct shm_pool *tee_shm_pool_create(struct device *dev, size_t shm_size,
 	chunk = _KMALLOC(sizeof(struct mem_chunk), GFP_KERNEL);
 	if (!chunk) {
 		dev_err(dev, "kmalloc <struct MemChunk> failed\n");
+		mutex_unlock(&pool->lock);
 		goto alloc_failed;
 	}
 	memset(chunk, 0, sizeof(*chunk));
@@ -370,7 +371,7 @@ unsigned long tee_shm_pool_v2p(struct device *dev, struct shm_pool *pool,
  * Allocate a memory chunk inside the memory region managed by the pool.
  *
  */
-unsigned long tee_shm_pool_alloc(struct device *dev,
+unsigned long rk_tee_shm_pool_alloc(struct device *dev,
 				 struct shm_pool *pool,
 				 size_t size, size_t alignment)
 {
@@ -508,7 +509,7 @@ failed_out:
 		_KFREE(next_chunk);
 
 	dev_err(dev,
-		"tee_shm_pool_alloc() FAILED, size=0x%zx, align=0x%zx free=%zu\n",
+		"rk_tee_shm_pool_alloc() FAILED, size=0x%zx, align=0x%zx free=%zu\n",
 		size, alignment, pool->size - pool->used);
 
 #if defined(_DUMP_INFO_ALLOCATOR) && (_DUMP_INFO_ALLOCATOR > 1)
@@ -558,6 +559,7 @@ int rk_tee_shm_pool_free(struct device *dev, struct shm_pool *pool,
 				dev_warn(dev,
 					 "< tee_shm_pool_free() WARNING, paddr=0x%p already released\n",
 					 (void *)paddr);
+				mutex_unlock(&pool->lock);
 				return -EINVAL;
 			} else if (--chunk->counter == 0) {
 				dev_dbg(dev, "paddr=%p\n", (void *)paddr);

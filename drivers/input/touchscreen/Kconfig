@@ -344,6 +344,11 @@ config TOUCHSCREEN_GOODIX
 	  To compile this driver as a module, choose M here: the
 	  module will be called goodix.
 
+config TOUCHSCREEN_GSLX680A
+        tristate "gslx 680a"
+        help
+          gslX680a touchpad driver for pad
+
 config TOUCHSCREEN_GSLX680_D708
 	tristate "gslX680 d708 touchpad driver for rk3126 pad"
 	help
@@ -368,6 +373,11 @@ config TOUCHSCREEN_GSL3673
 	tristate "gsl3673 touchpad driver for evb"
 	help
 	  gsl3673 touchpad driver for evb
+
+config TOUCHSCREEN_GSL3673_800X1280
+	tristate "gsl3673 touchpad driver for rk3326 board"
+	help
+	  gsl3673 touchpad driver for rk3326 board
 
 config TOUCHSCREEN_GT9XX
 	tristate "Goodix gt9xx support for rockchip platform"
@@ -1151,5 +1161,8 @@ config TOUCHSCREEN_ROHM_BU21023
 
 config TOUCHSCREEN_VTL_CT36X
 	tristate "VTL touchscreens support"
+
+config TOUCHSCREEN_GT1X
+	tristate "GT1X touchscreens support"
 
 endif

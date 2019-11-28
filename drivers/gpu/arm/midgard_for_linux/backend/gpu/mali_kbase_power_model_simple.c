@@ -34,7 +34,8 @@ static u32 static_coefficient;
 static s32 ts[4];
 static struct thermal_zone_device *gpu_tz;
 
-static unsigned long model_static_power(unsigned long voltage)
+static unsigned long model_static_power(struct devfreq *devfreq,
+					unsigned long voltage)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0)
 	unsigned long temperature;
@@ -45,7 +46,7 @@ static unsigned long model_static_power(unsigned long voltage)
 	unsigned long temp_squared, temp_cubed, temp_scaling_factor;
 	const unsigned long voltage_cubed = (voltage * voltage * voltage) >> 10;
 
-	if (gpu_tz) {
+	if (!IS_ERR_OR_NULL(gpu_tz) && gpu_tz->ops->get_temp) {
 		int ret;
 
 		ret = gpu_tz->ops->get_temp(gpu_tz, &temperature);
@@ -75,7 +76,8 @@ static unsigned long model_static_power(unsigned long voltage)
 				/ 1000000;
 }
 
-static unsigned long model_dynamic_power(unsigned long freq,
+static unsigned long model_dynamic_power(struct devfreq *devfreq,
+		unsigned long freq,
 		unsigned long voltage)
 {
 	/* The inputs: freq (f) is in Hz, and voltage (v) in mV.

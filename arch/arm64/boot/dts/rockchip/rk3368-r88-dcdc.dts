@@ -189,6 +189,27 @@
 	};
 };
 
+&firmware_android {
+	compatible = "android,firmware";
+	fstab {
+		compatible = "android,fstab";
+		system {
+			compatible = "android,system";
+			dev = "/dev/block/by-name/system";
+			type = "ext4";
+			mnt_flags = "ro,barrier=1,inode_readahead_blks=8";
+			fsmgr_flags = "wait,verify";
+		};
+		vendor {
+			compatible = "android,vendor";
+			dev = "/dev/block/by-name/vendor";
+			type = "ext4";
+			mnt_flags = "ro,barrier=1,inode_readahead_blks=8";
+			fsmgr_flags = "wait,verify";
+		};
+	};
+};
+
 &i2s_8ch {
 	status = "okay";
 	rockchip,i2s-broken-burst-len;
@@ -242,6 +263,8 @@
 
 &pwm1 {
 	status = "okay";
+	pinctrl-names = "active";
+	pinctrl-0 = <&pwm1_pin_pull_down>;
 };
 
 &i2c0 {
@@ -437,10 +460,6 @@
 	status = "okay";
 };
 
-&uart2 {
-	status = "okay";
-};
-
 &usb_host0_ehci {
 	status = "okay";
 };
@@ -548,7 +567,7 @@
 &pwm3 {
 	status = "okay";
 
-	interrupts = <GIC_SPI 78 IRQ_TYPE_LEVEL_HIGH 0>;
+	interrupts = <GIC_SPI 78 IRQ_TYPE_LEVEL_HIGH>;
 	compatible = "rockchip,remotectl-pwm";
 	remote_pwm_id = <3>;
 	handle_cpu_id = <1>;

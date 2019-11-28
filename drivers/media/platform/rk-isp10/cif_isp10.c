@@ -21,6 +21,8 @@
 #include "cif_isp10.h"
 #include <linux/pm_runtime.h>
 #include <linux/vmalloc.h>
+#include <dt-bindings/soc/rockchip-system-status.h>
+#include <soc/rockchip/rockchip-system-status.h>
 
 static int cif_isp10_mipi_isr(
 	unsigned int mis,
@@ -4418,6 +4420,7 @@ static int cif_isp10_mi_frame_end(
 			bool wake_now;
 
 			vb2_buf = &stream->curr_buf->vb.vb2_buf;
+			v4l2_get_timestamp(&stream->curr_buf->vb.timestamp);
 			vb2_buffer_done(vb2_buf, VB2_BUF_STATE_DONE);
 			wake_now = false;
 
@@ -5712,9 +5715,13 @@ int cif_isp10_streamon(
 	if (IS_ERR_VALUE(ret))
 		goto err;
 
+	rockchip_set_system_status(SYS_STATUS_ISP);
+
 	ret = cif_isp10_start(dev, streamon_sp, streamon_mp);
-	if (IS_ERR_VALUE(ret))
+	if (IS_ERR_VALUE(ret)) {
+		rockchip_clear_system_status(SYS_STATUS_ISP);
 		goto err;
+	}
 
 	cif_isp10_pltfrm_pr_dbg(dev->dev,
 		"SP state = %s, MP state = %s, DMA state = %s\n",
@@ -5779,7 +5786,7 @@ int cif_isp10_streamoff(
 	if (streamoff_all == (CIF_ISP10_STREAM_MP | CIF_ISP10_STREAM_SP)) {
 		struct cif_isp10_img_src_exp *exp;
 		spin_lock_irqsave(&dev->img_src_exps.lock, lock_flags);
-		if (!list_empty(&dev->img_src_exps.list)) {
+		while (!list_empty(&dev->img_src_exps.list)) {
 			exp = list_first_entry(&dev->img_src_exps.list,
 				struct cif_isp10_img_src_exp,
 				list);
@@ -5798,6 +5805,8 @@ int cif_isp10_streamoff(
 	if (streamoff_dma)
 		cif_isp10_stop_dma(dev);
 
+	rockchip_clear_system_status(SYS_STATUS_ISP);
+
 	cif_isp10_pltfrm_pr_dbg(dev->dev,
 		"SP state = %s, MP state = %s, DMA state = %s, # frames received = %d\n",
 		cif_isp10_state_string(dev->sp_stream.state),
@@ -5807,6 +5816,7 @@ int cif_isp10_streamoff(
 
 	return 0;
 err:
+	rockchip_clear_system_status(SYS_STATUS_ISP);
 	cif_isp10_pltfrm_pr_dbg(dev->dev,
 		"SP state = %s, MP state = %s, DMA state = %s\n",
 		cif_isp10_state_string(dev->sp_stream.state),
@@ -6296,7 +6306,8 @@ int cif_isp10_reqbufs(
 
 int cif_isp10_s_exp(
 	struct cif_isp10_device *dev,
-	struct cif_isp10_img_src_ext_ctrl *exp_ctrl)
+	struct cif_isp10_img_src_ext_ctrl *exp_ctrl,
+	bool cls_exp)
 {
 	struct cif_isp10_img_src_ctrl  *ctrl_exp_t = NULL, *ctrl_exp_g = NULL;
 	struct cif_isp10_img_src_exp *exp = NULL, *exp_t = NULL, *exp_g = NULL;
@@ -6310,6 +6321,21 @@ int cif_isp10_s_exp(
 	if (!dev->img_src_exps.inited) {
 		cif_isp10_config_img_src_exps(dev);
 		dev->img_src_exps.inited = true;
+	}
+
+	/* clean exposure list before */
+	if (cls_exp) {
+		spin_lock_irqsave(&dev->img_src_exps.lock, lock_flags);
+		while (!list_empty(&dev->img_src_exps.list)) {
+			exp = list_first_entry(&dev->img_src_exps.list,
+				struct cif_isp10_img_src_exp,
+				list);
+			list_del(&exp->list);
+			kfree(exp->exp.ctrls);
+			kfree(exp);
+		}
+		spin_unlock_irqrestore(&dev->img_src_exps.lock, lock_flags);
+		exp = NULL;
 	}
 
 	if (dev->img_src_exps.exp_valid_frms[VALID_FR_EXP_T_INDEX] ==
@@ -6818,6 +6844,7 @@ int cif_isp10_s_ctrl(
 	case CIF_ISP10_CID_AUTO_FPS:
 	case CIF_ISP10_CID_HFLIP:
 	case CIF_ISP10_CID_VFLIP:
+	case CIF_ISP10_CID_TEST_PATTERN:
 		return cif_isp10_img_src_s_ctrl(dev->img_src,
 			id, val);
 	case CIF_ISP10_CID_FOCUS_ABSOLUTE:

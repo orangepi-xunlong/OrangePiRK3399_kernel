@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -65,11 +66,6 @@ static ssize_t wifi_chip_read(struct class *cls, struct class_attribute *attr, c
         if(type == WIFI_AP6354) {
             count = sprintf(_buf, "%s", "AP6354");
             printk("Current WiFi chip is AP6354.\n");
-        }
-
-        if(type == WIFI_AP6356S) {
-            count = sprintf(_buf, "%s", "AP6356S");
-            printk("Current WiFi chip is AP6356S.\n");
         }
 
 	if(type == WIFI_AP6441) {
@@ -142,6 +138,10 @@ static ssize_t wifi_chip_read(struct class *cls, struct class_attribute *attr, c
 	    printk("Current WiFi chip is ESP8089.\n");
 	}
 
+        if(type == WIFI_SSV6051) {
+            count = sprintf(_buf, "%s", "SSV6051");
+            printk("Current WiFi chip is SSV6051.\n");
+        }
     return count;
 }
 
@@ -169,8 +169,6 @@ extern int rockchip_wifi_init_module_rkwifi(void);
 extern void rockchip_wifi_exit_module_rkwifi(void);
 extern int rockchip_wifi_init_module_rtkwifi(void);
 extern void rockchip_wifi_exit_module_rtkwifi(void);
-extern int rockchip_wifi_init_module_esp8089(void);
-extern void rockchip_wifi_exit_module_esp8089(void);
 #endif
 static struct semaphore driver_sem;
 #ifdef CONFIG_WIFI_LOAD_DRIVER_WHEN_KERNEL_BOOTUP

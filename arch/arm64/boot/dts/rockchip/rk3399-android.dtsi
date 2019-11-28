@@ -48,13 +48,7 @@
 	compatible = "rockchip,android", "rockchip,rk3399";
 
 	chosen {
-		bootargs = "earlycon=uart8250,mmio32,0xff1a0000 swiotlb=1";
-	};
-
-	cpuinfo {
-		compatible = "rockchip,cpuinfo";
-		nvmem-cells = <&efuse_id>;
-		nvmem-cell-names = "id";
+		bootargs = "earlycon=uart8250,mmio32,0xff1a0000 swiotlb=1 coherent_pool=1m";
 	};
 
 	ramoops_mem: ramoops_mem {
@@ -92,9 +86,9 @@
 			reg = <0x0 0x0 0x0 0x0>;
 		};
 
-		secure_memory: secure-memory@e7000000 {
+		secure_memory: secure-memory@20000000 {
 			compatible = "rockchip,secure-memory";
-			reg = <0x0 0xe7000000 0x0 0x10000000>;
+			reg = <0x0 0x20000000 0x0 0x10000000>;
 			status = "disabled";
 		};
 
@@ -170,8 +164,11 @@
 		compatible = "rockchip,rk3399-isp", "rockchip,isp";
 		reg = <0x0 0xff910000 0x0 0x4000>;
 		interrupts = <GIC_SPI 43 IRQ_TYPE_LEVEL_HIGH 0>;
+		assigned-clocks = <&cru SCLK_CIF_OUT_SRC>;
+		assigned-clock-parents = <&cru PLL_GPLL>;
+		assigned-clock-rates = <800000000>;
 		clocks =
-			<&cru SCLK_CIF_OUT>, <&cru SCLK_CIF_OUT>,
+			<&cru SCLK_CIF_OUT>, <&cru SCLK_CIF_OUT_SRC>,
 			<&cru SCLK_DPHY_TX1RX1_CFG>, <&cru SCLK_MIPIDPHY_REF>,
 			<&cru ACLK_ISP0_NOC>, <&cru ACLK_ISP0_WRAPPER>,
 			<&cru HCLK_ISP0_NOC>, <&cru HCLK_ISP0_WRAPPER>,
@@ -187,9 +184,9 @@
 			"isp_mipi_fl_prefl", "isp_flash_as_gpio",
 			"isp_flash_as_trigger_out";
 		pinctrl-0 = <&cif_clkout>;
-		pinctrl-1 = <&isp_dvp_d0d7>;
+		pinctrl-1 = <&cif_clkout &isp_dvp_d0d7>;
 		pinctrl-2 = <&cif_clkout>;
-		pinctrl-3 = <&isp_prelight>;
+		pinctrl-3 = <&cif_clkout &isp_prelight>;
 		pinctrl-4 = <&isp_flash_trigger_as_gpio>;
 		pinctrl-5 = <&isp_flash_trigger>;
 		rockchip,isp,mipiphy = <2>;
@@ -212,7 +209,7 @@
 			<&cru ACLK_ISP1_NOC>, <&cru ACLK_ISP1_WRAPPER>,
 			<&cru HCLK_ISP1_NOC>, <&cru HCLK_ISP1_WRAPPER>,
 			<&cru SCLK_ISP1>, <&cru SCLK_CIF_OUT>,
-			<&cru SCLK_CIF_OUT>, <&cru SCLK_DPHY_TX1RX1_CFG>,
+			<&cru SCLK_CIF_OUT_SRC>, <&cru SCLK_DPHY_TX1RX1_CFG>,
 			<&cru SCLK_MIPIDPHY_REF>, <&cru PCLK_ISP1_WRAPPER>,
 			<&cru SCLK_DPHY_RX0_CFG>, <&cru PCLK_MIPI_DSI1>,
 			<&cru SCLK_MIPIDPHY_CFG>;
@@ -229,7 +226,7 @@
 			"isp_mipi_fl_prefl", "isp_flash_as_gpio",
 			"isp_flash_as_trigger_out";
 		pinctrl-0 = <&cif_clkout>;
-		pinctrl-1 = <&isp_dvp_d0d7>;
+		pinctrl-1 = <&cif_clkout &isp_dvp_d0d7>;
 		pinctrl-2 = <&cif_clkout>;
 		pinctrl-3 = <&isp_prelight>;
 		pinctrl-4 = <&isp_flash_trigger_as_gpio>;
@@ -258,6 +255,14 @@
 		rockchip,cpu = <&i2s2>;
 		rockchip,codec = <&hdmi>, <&cdn_dp>;
 	};
+
+	firmware {
+		firmware_android: android {};
+	};
+};
+
+&uart2 {
+	status = "disabled";
 };
 
 &vopb {

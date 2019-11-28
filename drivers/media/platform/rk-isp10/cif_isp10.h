@@ -162,6 +162,7 @@ enum cif_isp10_cid {
 	CIF_ISP10_CID_VBLANKING                   = 17,
 	CIF_ISP10_CID_ISO_SENSITIVITY             = 18,
 	CIF_ISP10_CID_MIN_BUFFER_FOR_CAPTURE      = 19,
+	CIF_ISP10_CID_TEST_PATTERN                = 20,
 
 };
 
@@ -673,6 +674,8 @@ struct cif_isp10_device {
 	struct pltfrm_soc_cfg soc_cfg;
 	void *nodes;
 
+	struct mutex api_mutex; /* user api mutex */
+
 };
 
 struct cif_isp10_fmt *get_cif_isp10_output_format(int index);
@@ -799,7 +802,8 @@ int cif_isp10_s_vb_metadata(
 
 int cif_isp10_s_exp(
 	struct cif_isp10_device *dev,
-	struct cif_isp10_img_src_ext_ctrl *exp_ctrl);
+	struct cif_isp10_img_src_ext_ctrl *exp_ctrl,
+	bool cls_exp);
 
 int cif_isp10_s_vcm(
 	struct cif_isp10_device *dev,

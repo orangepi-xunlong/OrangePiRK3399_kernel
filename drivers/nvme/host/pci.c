@@ -1583,23 +1583,26 @@ static int nvme_create_queue(struct nvme_queue *nvmeq, int qid)
 	nvmeq->cq_vector = qid - 1;
 	result = adapter_alloc_cq(dev, qid, nvmeq);
 	if (result < 0)
-		return result;
+		goto release_vector;
 
 	result = adapter_alloc_sq(dev, qid, nvmeq);
 	if (result < 0)
 		goto release_cq;
 
+	nvme_init_queue(nvmeq, qid);
 	result = queue_request_irq(dev, nvmeq, nvmeq->irqname);
 	if (result < 0)
 		goto release_sq;
 
-	nvme_init_queue(nvmeq, qid);
 	return result;
 
  release_sq:
+	dev->online_queues--;
 	adapter_delete_sq(dev, qid);
  release_cq:
 	adapter_delete_cq(dev, qid);
+ release_vector:
+	nvmeq->cq_vector = -1;
 	return result;
 }
 
@@ -1794,6 +1797,7 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
 		goto free_nvmeq;
 
 	nvmeq->cq_vector = 0;
+	nvme_init_queue(nvmeq, 0);
 	result = queue_request_irq(dev, nvmeq, nvmeq->irqname);
 	if (result) {
 		nvmeq->cq_vector = -1;
@@ -2295,11 +2299,12 @@ static void nvme_alloc_ns(struct nvme_dev *dev, unsigned nsid)
 	disk->queue = ns->queue;
 	disk->driverfs_dev = dev->device;
 	disk->flags = GENHD_FL_EXT_DEVT;
-#ifdef CONFIG_ARCH_ROCKCHIP
-	disk->is_rk_disk = true;
-#else
-	disk->is_rk_disk = false;
-#endif
+
+	if (strstr(saved_command_line, "storagemedia=nvme"))
+		disk->is_rk_disk = true;
+	else
+		disk->is_rk_disk = false;
+
 	sprintf(disk->disk_name, "nvme%dn%d", dev->instance, nsid);
 
 	/*
@@ -2981,10 +2986,16 @@ static void nvme_dev_shutdown(struct nvme_dev *dev)
 	mutex_unlock(&dev->shutdown_lock);
 }
 
-static void nvme_dev_remove(struct nvme_dev *dev)
+static void nvme_remove_namespaces(struct nvme_dev *dev)
 {
 	struct nvme_ns *ns, *next;
 
+	list_for_each_entry_safe(ns, next, &dev->namespaces, list)
+		nvme_ns_remove(ns);
+}
+
+static void nvme_dev_remove(struct nvme_dev *dev)
+{
 	if (nvme_io_incapable(dev)) {
 		/*
 		 * If the device is not capable of IO (surprise hot-removal,
@@ -2994,8 +3005,7 @@ static void nvme_dev_remove(struct nvme_dev *dev)
 		 */
 		nvme_dev_shutdown(dev);
 	}
-	list_for_each_entry_safe(ns, next, &dev->namespaces, list)
-		nvme_ns_remove(ns);
+	nvme_remove_namespaces(dev);
 }
 
 static int nvme_setup_prp_pools(struct nvme_dev *dev)
@@ -3162,7 +3172,6 @@ static void nvme_probe_work(struct work_struct *work)
 		goto disable;
 	}
 
-	nvme_init_queue(dev->queues[0], 0);
 	result = nvme_alloc_admin_tags(dev);
 	if (result)
 		goto disable;
@@ -3179,7 +3188,7 @@ static void nvme_probe_work(struct work_struct *work)
 	 */
 	if (dev->online_queues < 2) {
 		dev_warn(dev->dev, "IO queues not created\n");
-		nvme_dev_remove(dev);
+		nvme_remove_namespaces(dev);
 	} else {
 		nvme_unfreeze_queues(dev);
 		nvme_dev_add(dev);

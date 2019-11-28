@@ -23,17 +23,9 @@
 #include <soc/rockchip/rockchip_dmc.h>
 
 #include "rockchip_drm_drv.h"
+#include "rockchip_drm_fb.h"
 #include "rockchip_drm_gem.h"
 #include "rockchip_drm_backlight.h"
-
-#define to_rockchip_fb(x) container_of(x, struct rockchip_drm_fb, fb)
-
-struct rockchip_drm_fb {
-	struct drm_framebuffer fb;
-	dma_addr_t dma_addr[ROCKCHIP_MAX_FB_BUFFER];
-	struct drm_gem_object *obj[ROCKCHIP_MAX_FB_BUFFER];
-	struct rockchip_logo *logo;
-};
 
 bool rockchip_fb_is_logo(struct drm_framebuffer *fb)
 {
@@ -51,6 +43,16 @@ dma_addr_t rockchip_fb_get_dma_addr(struct drm_framebuffer *fb,
 		return 0;
 
 	return rk_fb->dma_addr[plane];
+}
+
+void *rockchip_fb_get_kvaddr(struct drm_framebuffer *fb, unsigned int plane)
+{
+	struct rockchip_drm_fb *rk_fb = to_rockchip_fb(fb);
+
+	if (WARN_ON(plane >= ROCKCHIP_MAX_FB_BUFFER))
+		return 0;
+
+	return rk_fb->kvaddr[plane];
 }
 
 static void rockchip_drm_fb_destroy(struct drm_framebuffer *fb)
@@ -98,6 +100,8 @@ rockchip_fb_alloc(struct drm_device *dev, struct drm_mode_fb_cmd2 *mode_cmd,
 {
 	struct rockchip_drm_fb *rockchip_fb;
 	struct rockchip_gem_object *rk_obj;
+	struct rockchip_drm_private *private = dev->dev_private;
+	struct drm_fb_helper *fb_helper = private->fbdev_helper;
 	int ret = 0;
 	int i;
 
@@ -122,10 +126,15 @@ rockchip_fb_alloc(struct drm_device *dev, struct drm_mode_fb_cmd2 *mode_cmd,
 		for (i = 0; i < num_planes; i++) {
 			rk_obj = to_rockchip_obj(obj[i]);
 			rockchip_fb->dma_addr[i] = rk_obj->dma_addr;
+			rockchip_fb->kvaddr[i] = rk_obj->kvaddr;
+			private->fbdev_bo = &rk_obj->base;
+			if (fb_helper && fb_helper->fbdev && rk_obj->kvaddr)
+				fb_helper->fbdev->screen_base = rk_obj->kvaddr;
 		}
 #ifndef MODULE
 	} else if (logo) {
 		rockchip_fb->dma_addr[0] = logo->dma_addr;
+		rockchip_fb->kvaddr[0] = logo->kvaddr;
 		rockchip_fb->logo = logo;
 		logo->count++;
 #endif
@@ -214,7 +223,8 @@ static void rockchip_drm_output_poll_changed(struct drm_device *dev)
 
 static int rockchip_drm_bandwidth_atomic_check(struct drm_device *dev,
 					       struct drm_atomic_state *state,
-					       size_t *bandwidth)
+					       size_t *bandwidth,
+					       unsigned int *plane_num)
 {
 	struct rockchip_drm_private *priv = dev->dev_private;
 	struct drm_crtc_state *crtc_state;
@@ -223,17 +233,27 @@ static int rockchip_drm_bandwidth_atomic_check(struct drm_device *dev,
 	int i, ret = 0;
 
 	*bandwidth = 0;
+	*plane_num = 0;
 	for_each_crtc_in_state(state, crtc, crtc_state, i) {
 		funcs = priv->crtc_funcs[drm_crtc_index(crtc)];
 
 		if (funcs && funcs->bandwidth)
-			*bandwidth += funcs->bandwidth(crtc, crtc_state);
+			*bandwidth += funcs->bandwidth(crtc, crtc_state,
+						       plane_num);
 	}
 
 	/*
 	 * Check ddr frequency support here here.
 	 */
-	ret = rockchip_dmcfreq_vop_bandwidth_request(*bandwidth);
+	if (priv->dmc_support && !priv->devfreq) {
+		priv->devfreq = devfreq_get_devfreq_by_phandle(dev->dev, 0);
+		if (IS_ERR(priv->devfreq))
+			priv->devfreq = NULL;
+	}
+
+	if (priv->devfreq)
+		ret = rockchip_dmcfreq_vop_bandwidth_request(priv->devfreq,
+							     *bandwidth);
 
 	return ret;
 }
@@ -243,7 +263,9 @@ rockchip_atomic_commit_complete(struct rockchip_atomic_commit *commit)
 {
 	struct drm_atomic_state *state = commit->state;
 	struct drm_device *dev = commit->dev;
+	struct rockchip_drm_private *prv = dev->dev_private;
 	size_t bandwidth = commit->bandwidth;
+	unsigned int plane_num = commit->plane_num;
 
 	/*
 	 * TODO: do fence wait here.
@@ -272,7 +294,14 @@ rockchip_atomic_commit_complete(struct rockchip_atomic_commit *commit)
 
 	rockchip_drm_backlight_update(dev);
 
-	rockchip_dmcfreq_vop_bandwidth_update(bandwidth);
+	if (prv->dmc_support && !prv->devfreq) {
+		prv->devfreq = devfreq_get_devfreq_by_phandle(dev->dev, 0);
+		if (IS_ERR(prv->devfreq))
+			prv->devfreq = NULL;
+	}
+	if (prv->devfreq)
+		rockchip_dmcfreq_vop_bandwidth_update(prv->devfreq, bandwidth,
+						      plane_num);
 
 	drm_atomic_helper_commit_planes(dev, state, true);
 
@@ -298,13 +327,14 @@ void rockchip_drm_atomic_work(struct work_struct *work)
 	private->commit = NULL;
 }
 
-int rockchip_drm_atomic_commit(struct drm_device *dev,
-			       struct drm_atomic_state *state,
-			       bool async)
+static int rockchip_drm_atomic_commit(struct drm_device *dev,
+				      struct drm_atomic_state *state,
+				      bool async)
 {
 	struct rockchip_drm_private *private = dev->dev_private;
 	struct rockchip_atomic_commit *commit;
 	size_t bandwidth;
+	unsigned int plane_num;
 	int ret;
 
 	ret = drm_atomic_helper_setup_commit(state, false);
@@ -315,7 +345,8 @@ int rockchip_drm_atomic_commit(struct drm_device *dev,
 	if (ret)
 		return ret;
 
-	ret = rockchip_drm_bandwidth_atomic_check(dev, state, &bandwidth);
+	ret = rockchip_drm_bandwidth_atomic_check(dev, state, &bandwidth,
+						  &plane_num);
 	if (ret) {
 		/*
 		 * TODO:
@@ -333,6 +364,7 @@ int rockchip_drm_atomic_commit(struct drm_device *dev,
 	commit->dev = dev;
 	commit->state = state;
 	commit->bandwidth = bandwidth;
+	commit->plane_num = plane_num;
 
 	if (async) {
 		mutex_lock(&private->commit_lock);
@@ -383,6 +415,7 @@ void rockchip_drm_mode_config_init(struct drm_device *dev)
 	 */
 	dev->mode_config.max_width = 8192;
 	dev->mode_config.max_height = 8192;
+	dev->mode_config.async_page_flip = true;
 
 	dev->mode_config.funcs = &rockchip_drm_mode_config_funcs;
 }

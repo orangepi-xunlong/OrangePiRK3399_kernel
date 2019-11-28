@@ -77,7 +77,10 @@ enum {
 #define REG_INT_START     BIT(4) /* START condition generated */
 #define REG_INT_STOP      BIT(5) /* STOP condition generated */
 #define REG_INT_NAKRCV    BIT(6) /* NACK received */
-#define REG_INT_ALL       0x7f
+#define REG_INT_ALL       0xff
+
+/* Disable i2c all irqs */
+#define IEN_ALL_DISABLE   0
 
 /* Constants */
 #define WAIT_TIMEOUT      1000 /* ms */
@@ -223,6 +226,7 @@ struct rk3x_i2c {
 	enum rk3x_i2c_state state;
 	unsigned int processed;
 	int error;
+	unsigned int suspended:1;
 
 	struct notifier_block i2c_restart_nb;
 };
@@ -242,6 +246,18 @@ static inline u32 i2c_readl(struct rk3x_i2c *i2c, unsigned int offset)
 static inline void rk3x_i2c_clean_ipd(struct rk3x_i2c *i2c)
 {
 	i2c_writel(i2c, REG_INT_ALL, REG_IPD);
+}
+
+static inline void rk3x_i2c_disable_irq(struct rk3x_i2c *i2c)
+{
+	i2c_writel(i2c, IEN_ALL_DISABLE, REG_IEN);
+}
+
+static inline void rk3x_i2c_disable(struct rk3x_i2c *i2c)
+{
+	u32 val = i2c_readl(i2c, REG_CON) & REG_CON_TUNING_MASK;
+
+	i2c_writel(i2c, val, REG_CON);
 }
 
 /**
@@ -509,8 +525,10 @@ static irqreturn_t rk3x_i2c_irq(int irqno, void *dev_id)
 
 		ipd &= ~REG_INT_NAKRCV;
 
-		if (!(i2c->msg->flags & I2C_M_IGNORE_NAK))
+		if (!(i2c->msg->flags & I2C_M_IGNORE_NAK)) {
 			rk3x_i2c_stop(i2c, -ENXIO);
+			goto out;
+		}
 	}
 
 	/* is there anything left to handle? */
@@ -1058,6 +1076,9 @@ static int rk3x_i2c_xfer(struct i2c_adapter *adap,
 	int ret = 0;
 	int i;
 
+	if (i2c->suspended)
+		return -EACCES;
+
 	spin_lock_irqsave(&i2c->lock, flags);
 
 	clk_enable(i2c->clk);
@@ -1094,7 +1115,7 @@ static int rk3x_i2c_xfer(struct i2c_adapter *adap,
 				i2c_readl(i2c, REG_IPD), i2c->state);
 
 			/* Force a STOP condition without interrupt */
-			i2c_writel(i2c, 0, REG_IEN);
+			rk3x_i2c_disable_irq(i2c);
 			val = i2c_readl(i2c, REG_CON) & REG_CON_TUNING_MASK;
 			val |= REG_CON_EN | REG_CON_STOP;
 			i2c_writel(i2c, val, REG_CON);
@@ -1110,6 +1131,9 @@ static int rk3x_i2c_xfer(struct i2c_adapter *adap,
 			break;
 		}
 	}
+
+	rk3x_i2c_disable_irq(i2c);
+	rk3x_i2c_disable(i2c);
 
 	clk_disable(i2c->pclk);
 	clk_disable(i2c->clk);
@@ -1152,11 +1176,34 @@ static int rk3x_i2c_restart_notify(struct notifier_block *this,
 	return NOTIFY_DONE;
 }
 
-static __maybe_unused int rk3x_i2c_resume(struct device *dev)
+static __maybe_unused int rk3x_i2c_suspend_noirq(struct device *dev)
+{
+	struct rk3x_i2c *i2c = dev_get_drvdata(dev);
+
+	/*
+	 * Below code is needed only to ensure that there are no
+	 * activities on I2C bus. if at this moment any driver
+	 * is trying to use I2C bus - this may cause i2c timeout.
+	 *
+	 * So forbid access to I2C device using i2c->suspended flag.
+	 */
+	i2c_lock_adapter(&i2c->adap);
+	i2c->suspended = 1;
+	i2c_unlock_adapter(&i2c->adap);
+
+	return 0;
+}
+
+static __maybe_unused int rk3x_i2c_resume_noirq(struct device *dev)
 {
 	struct rk3x_i2c *i2c = dev_get_drvdata(dev);
 
 	rk3x_i2c_adapt_div(i2c, clk_get_rate(i2c->clk));
+
+	/* Allow access to I2C bus */
+	i2c_lock_adapter(&i2c->adap);
+	i2c->suspended = 0;
+	i2c_unlock_adapter(&i2c->adap);
 
 	return 0;
 }
@@ -1169,6 +1216,11 @@ static u32 rk3x_i2c_func(struct i2c_adapter *adap)
 static const struct i2c_algorithm rk3x_i2c_algorithm = {
 	.master_xfer		= rk3x_i2c_xfer,
 	.functionality		= rk3x_i2c_func,
+};
+
+static const struct rk3x_i2c_soc_data rv1108_soc_data = {
+	.grf_offset = -1,
+	.calc_timings = rk3x_i2c_v1_calc_timings,
 };
 
 static const struct rk3x_i2c_soc_data rk3066_soc_data = {
@@ -1202,6 +1254,10 @@ static const struct rk3x_i2c_soc_data rk3399_soc_data = {
 };
 
 static const struct of_device_id rk3x_i2c_match[] = {
+	{
+		.compatible = "rockchip,rv1108-i2c",
+		.data = (void *)&rv1108_soc_data
+	},
 	{
 		.compatible = "rockchip,rk3066-i2c",
 		.data = (void *)&rk3066_soc_data
@@ -1398,7 +1454,10 @@ static int rk3x_i2c_remove(struct platform_device *pdev)
 	return 0;
 }
 
-static SIMPLE_DEV_PM_OPS(rk3x_i2c_pm_ops, NULL, rk3x_i2c_resume);
+const static struct dev_pm_ops rk3x_i2c_pm_ops = {
+	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(rk3x_i2c_suspend_noirq,
+				      rk3x_i2c_resume_noirq)
+};
 
 static struct platform_driver rk3x_i2c_driver = {
 	.probe   = rk3x_i2c_probe,

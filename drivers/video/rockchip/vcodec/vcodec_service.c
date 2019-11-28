@@ -20,6 +20,8 @@
 #include <linux/clk.h>
 #include <linux/compat.h>
 #include <linux/delay.h>
+#include <linux/devfreq.h>
+#include <linux/devfreq_cooling.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
@@ -38,15 +40,21 @@
 #include <linux/mfd/syscon.h>
 #include <linux/uaccess.h>
 #include <linux/debugfs.h>
+#include <linux/pm_opp.h>
 #include <linux/pm_runtime.h>
 #include <linux/iopoll.h>
 
-#include <linux/rockchip/pmu.h>
+#include <linux/regulator/consumer.h>
 #include <linux/rockchip/grf.h>
+#include <linux/rockchip/rockchip_sip.h>
+#include <linux/thermal.h>
 
+#include <linux/dma-iommu.h>
 #include <linux/dma-buf.h>
 #include <linux/rockchip-iovmm.h>
 #include <video/rk_vpu_service.h>
+#include <soc/rockchip/pm_domains.h>
+#include <soc/rockchip/rockchip_opp_select.h>
 
 #include "vcodec_hw_info.h"
 #include "vcodec_hw_vpu.h"
@@ -56,6 +64,8 @@
 #include "vcodec_service.h"
 
 #include "vcodec_iommu_ops.h"
+
+#include "../../../devfreq/governor.h"
 
 /*
  * debug flag usage:
@@ -89,8 +99,19 @@
 #define MHZ					(1000 * 1000)
 #define SIZE_REG(reg)				((reg) * 4)
 
-#define VCODEC_CLOCK_ENABLE	1
-#define EXTRA_INFO_MAGIC	0x4C4A46
+#define VCODEC_CLOCK_ENABLE			1
+#define IOMMU_PAGE_SIZE				4096
+#define EXTRA_INFO_MAGIC			0x4C4A46
+
+#define RK3328_VCODEC_RATE_ON			(500 * MHZ)
+#define RK3328_CODE_RATE_ON			(250 * MHZ)
+#define RK3328_CABAC_RATE_ON			(400 * MHZ)
+#define RK3328_VCODEC_RATE_OFF			(100 * MHZ)
+#define RK3328_CODE_RATE_OFF			(100 * MHZ)
+#define RK3328_CABAC_RATE_OFF			(100 * MHZ)
+
+#define FALLBACK_STATIC_TEMPERATURE		55000
+#define MAX_VCODEC_SUBDEV_COUNT			2
 
 static int debug;
 module_param(debug, int, S_IRUGO | S_IWUSR);
@@ -115,6 +136,13 @@ MODULE_PARM_DESC(debug, "bit switch for vcodec_service debug information");
  *    Descriptor: struct vpu_trans_info
  */
 
+enum SET_CLK_EVENT {
+	EVENT_POWER_ON = 0,
+	EVENT_POWER_OFF,
+	EVENT_ADJUST,
+	EVENT_THERMAL,
+};
+
 enum VPU_FREQ {
 	VPU_FREQ_200M,
 	VPU_FREQ_266M,
@@ -135,6 +163,11 @@ struct extra_info_for_iommu {
 	u32 magic;
 	u32 cnt;
 	struct extra_info_elem elem[20];
+};
+
+struct vcodec_iommu_drm_info {
+	struct iommu_domain *domain;
+	bool attached;
 };
 
 static const struct vcodec_info vcodec_info_set[] = {
@@ -180,27 +213,6 @@ static const struct vcodec_info vcodec_info_set[] = {
 		.task_info	= task_rkv,
 		.trans_info	= trans_rkv,
 	},
-};
-
-/* Both VPU1 and VPU2 */
-static const struct vcodec_device_info vpu_device_info = {
-	.device_type = VCODEC_DEVICE_TYPE_VPUX,
-	.name = "vpu-service",
-};
-
-static const struct vcodec_device_info vpu_combo_device_info = {
-	.device_type = VCODEC_DEVICE_TYPE_VPUC,
-	.name = "vpu-combo",
-};
-
-static const struct vcodec_device_info hevc_device_info = {
-	.device_type = VCODEC_DEVICE_TYPE_HEVC,
-	.name = "hevc-service",
-};
-
-static const struct vcodec_device_info rkvd_device_info = {
-	.device_type = VCODEC_DEVICE_TYPE_RKVD,
-	.name = "rkvdec",
 };
 
 #define DEBUG
@@ -250,7 +262,7 @@ struct vcodec_mem_region {
 	/* virtual address for iommu */
 	dma_addr_t iova;
 	unsigned long len;
-	u32 reg_idx;
+	int reg_idx;
 	int hdl;
 };
 
@@ -275,7 +287,8 @@ struct vpu_reg {
 };
 
 enum vpu_ctx_state {
-	MMU_ACTIVATED	= BIT(0)
+	MMU_ACTIVATED	= BIT(0),
+	MMU_PAGEFAULT	= BIT(1)
 };
 
 struct vpu_subdev_data {
@@ -288,6 +301,7 @@ struct vpu_subdev_data {
 	int irq_dec;
 	struct vpu_service_info *pservice;
 
+	struct resource *res;
 	u32 *regs;
 	enum VCODEC_RUNNING_MODE mode;
 	struct list_head lnk_service;
@@ -307,6 +321,8 @@ struct vpu_subdev_data {
 
 	struct device *mmu_dev;
 	struct vcodec_iommu_info *iommu_info;
+	int pa_hdl;
+	unsigned long pa_iova;
 	struct work_struct set_work;
 };
 
@@ -339,6 +355,7 @@ struct vpu_service_info {
 	 * this is a temporary solution.
 	 */
 	struct mutex reset_lock;
+	struct mutex sip_reset_lock; /* sip smc reset lock */
 	struct vpu_reg *reg_codec;
 	struct vpu_reg *reg_pproc;
 	struct vpu_reg *reg_resev;
@@ -347,6 +364,7 @@ struct vpu_service_info {
 
 	bool auto_freq;
 	bool bug_dec_addr;
+	bool soft_reset;
 	atomic_t freq_status;
 
 	bool secure_isr;
@@ -354,11 +372,30 @@ struct vpu_service_info {
 	atomic_t secure_mode;
 	wait_queue_head_t *wait_secure_isr;
 
+	struct devfreq *devfreq;
+	struct regulator *vdd_vcodec;
+	struct mutex set_clk_lock; /* set clk lock */
+
+	unsigned long volt;
+	unsigned long vcodec_rate;
+	unsigned long core_rate;
+	unsigned long cabac_rate;
+	unsigned int thermal_div;
+
+	struct thermal_cooling_device *devfreq_cooling;
+	u32 static_coefficient;
+	s32 ts[4];
+	struct thermal_zone_device *vcodec_tz;
+
 	struct clk *aclk_vcodec;
 	struct clk *hclk_vcodec;
 	struct clk *clk_core;
 	struct clk *clk_cabac;
 	struct clk *pd_video;
+
+	unsigned long aclk_vcodec_default_rate;
+	unsigned long clk_core_default_rate;
+	unsigned long clk_cabac_default_rate;
 
 #ifdef CONFIG_RESET_CONTROLLER
 	struct reset_control *rst_a;
@@ -391,9 +428,33 @@ struct vpu_service_info {
 	char *name;
 
 	u32 subcnt;
+	struct platform_device *sub_pdev[MAX_VCODEC_SUBDEV_COUNT];
 	struct list_head subdev_list;
 
 	u32 alloc_type;
+
+	struct vcodec_hw_ops *hw_ops;
+	const struct vcodec_hw_var *hw_var;
+	struct devfreq *parent_devfreq;
+	struct notifier_block devfreq_nb;
+};
+
+struct vcodec_hw_ops {
+	void (*power_on)(struct vpu_service_info *pservice);
+	void (*power_off)(struct vpu_service_info *pservice);
+	void (*get_freq)(struct vpu_subdev_data *data, struct vpu_reg *reg);
+	void (*set_freq)(struct vpu_service_info *pservice,
+			 struct vpu_reg *reg);
+	void (*reduce_freq)(struct vpu_service_info *pservice);
+	void (*clr_cache)(struct vpu_service_info *pservice);
+};
+
+struct vcodec_hw_var {
+	s32 device_type;
+	u8 *name;
+	struct vcodec_hw_ops *ops;
+	int (*init)(struct vpu_service_info *pservice);
+	void (*config)(struct vpu_subdev_data *data);
 };
 
 #ifdef CONFIG_COMPAT
@@ -403,22 +464,22 @@ struct compat_vpu_request {
 };
 #endif
 
-#define VDPU_SOFT_RESET_REG	101
-#define VDPU_CLEAN_CACHE_REG	516
-#define VEPU_CLEAN_CACHE_REG	772
-#define HEVC_CLEAN_CACHE_REG	260
+#define VDPU_CLR_CACHE_REG	516
+#define VEPU_CLR_CACHE_REG	772
+#define VDEC_CLR_CACHE0_REG	260
+#define VDEC_CLR_CACHE1_REG	276
 
-#define VPU_REG_ENABLE(base, reg)	writel_relaxed(1, base + reg)
+#define VPU_REG_EN(base, reg)	writel_relaxed(1, (base) + (reg))
 
-#define VDPU_SOFT_RESET(base)	VPU_REG_ENABLE(base, VDPU_SOFT_RESET_REG)
-#define VDPU_CLEAN_CACHE(base)	VPU_REG_ENABLE(base, VDPU_CLEAN_CACHE_REG)
-#define VEPU_CLEAN_CACHE(base)	VPU_REG_ENABLE(base, VEPU_CLEAN_CACHE_REG)
-#define HEVC_CLEAN_CACHE(base)	VPU_REG_ENABLE(base, HEVC_CLEAN_CACHE_REG)
+#define VDPU_CLR_CACHE(base)	VPU_REG_EN(base, VDPU_CLR_CACHE_REG)
+#define VEPU_CLR_CACHE(base)	VPU_REG_EN(base, VEPU_CLR_CACHE_REG)
+#define VDEC_CLR_CACHE0(base)	VPU_REG_EN(base, VDEC_CLR_CACHE0_REG)
+#define VDEC_CLR_CACHE1(base)	VPU_REG_EN(base, VDEC_CLR_CACHE1_REG)
 
 #define VPU_POWER_OFF_DELAY		(4 * HZ) /* 4s */
 #define VPU_TIMEOUT_DELAY		(2 * HZ) /* 2s */
 
-static void *vcodec_get_drv_data(struct platform_device *pdev);
+static void vcodec_reduce_freq_rk3328(struct vpu_service_info *pservice);
 
 static void vpu_service_power_on(struct vpu_subdev_data *data,
 				 struct vpu_service_info *pservice);
@@ -483,7 +544,8 @@ static void vcodec_enter_mode(struct vpu_subdev_data *data)
 	 * For the RK3228H, it is not necessary to write a register to
 	 * switch vpu combo mode, it is unsafe to write the grf.
 	 */
-	if (pservice->subcnt < 2 || pservice->mode_ctrl == 0) {
+	if (pservice->subcnt < MAX_VCODEC_SUBDEV_COUNT ||
+	    pservice->mode_ctrl == 0) {
 		if (data->mmu_dev && !test_bit(MMU_ACTIVATED, &data->state)) {
 			set_bit(MMU_ACTIVATED, &data->state);
 
@@ -518,11 +580,12 @@ static void vcodec_enter_mode(struct vpu_subdev_data *data)
 
 	if (data->mmu_dev && !test_bit(MMU_ACTIVATED, &data->state)) {
 		set_bit(MMU_ACTIVATED, &data->state);
-		if (atomic_read(&pservice->enabled))
+		if (atomic_read(&pservice->enabled)) {
 			vcodec_iommu_attach(data->iommu_info);
-		else
-			/* FIXME BUG_ON should not be used in mass produce */
-			BUG_ON(!atomic_read(&pservice->enabled));
+		} else {
+			WARN_ON(!atomic_read(&pservice->enabled));
+			pr_err("reset mmu when service is disabled, do nothing\n");
+		}
 	}
 
 	pservice->prev_mode = pservice->curr_mode;
@@ -558,22 +621,26 @@ static int vpu_get_clk(struct vpu_service_info *pservice)
 		if (IS_ERR(pservice->clk_cabac)) {
 			dev_err(dev, "failed on clk_get clk_cabac\n");
 			pservice->clk_cabac = NULL;
+		} else {
+			pservice->clk_cabac_default_rate =
+				clk_get_rate(pservice->clk_cabac);
 		}
 		pservice->clk_core = devm_clk_get(dev, "clk_core");
 		if (IS_ERR(pservice->clk_core)) {
 			dev_err(dev, "failed on clk_get clk_core\n");
 			pservice->clk_core = NULL;
-			/* The VDPU and AVSD combo doesn't need those clocks */
-			if (pservice->dev_id == VCODEC_DEVICE_ID_RKVDEC)
-				return -1;
+		} else {
+			pservice->clk_core_default_rate =
+				clk_get_rate(pservice->clk_core);
 		}
 	case VCODEC_DEVICE_ID_VPU:
 		pservice->aclk_vcodec = devm_clk_get(dev, "aclk_vcodec");
 		if (IS_ERR(pservice->aclk_vcodec)) {
 			dev_err(dev, "failed on clk_get aclk_vcodec\n");
-			pservice->aclk_vcodec = NULL;
 			return -1;
 		}
+		pservice->aclk_vcodec_default_rate =
+			clk_get_rate(pservice->aclk_vcodec);
 
 		pservice->hclk_vcodec = devm_clk_get(dev, "hclk_vcodec");
 		if (IS_ERR(pservice->hclk_vcodec)) {
@@ -581,7 +648,7 @@ static int vpu_get_clk(struct vpu_service_info *pservice)
 			pservice->hclk_vcodec = NULL;
 			return -1;
 		}
-		if (pservice->pd_video == NULL) {
+		if (!pservice->pd_video) {
 			pservice->pd_video = devm_clk_get(dev, "pd_video");
 			if (IS_ERR(pservice->pd_video)) {
 				pservice->pd_video = NULL;
@@ -599,48 +666,73 @@ static int vpu_get_clk(struct vpu_service_info *pservice)
 #endif
 }
 
+static void rkvdec_dvfs_set_clk(struct vpu_service_info *pservice,
+				u32 vcodec_rate, u32 core_rate,
+				u32 cabac_rate)
+{
+	struct devfreq *devfreq = pservice->devfreq;
+
+	mutex_lock(&devfreq->lock);
+
+	pservice->vcodec_rate = vcodec_rate;
+	pservice->core_rate = core_rate;
+	pservice->cabac_rate = cabac_rate;
+
+	devfreq->min_freq = vcodec_rate;
+	devfreq->max_freq = vcodec_rate;
+	update_devfreq(devfreq);
+
+	mutex_unlock(&devfreq->lock);
+}
+
 static void _vpu_reset(struct vpu_subdev_data *data)
 {
 	struct vpu_service_info *pservice = data->pservice;
-	unsigned long rate = 0;
 
 	dev_info(pservice->dev, "resetting...\n");
-	WARN_ON(pservice->reg_codec != NULL);
-	WARN_ON(pservice->reg_pproc != NULL);
-	WARN_ON(pservice->reg_resev != NULL);
+	WARN_ON(pservice->reg_codec);
+	WARN_ON(pservice->reg_pproc);
+	WARN_ON(pservice->reg_resev);
 	pservice->reg_codec = NULL;
 	pservice->reg_pproc = NULL;
 	pservice->reg_resev = NULL;
 
 #ifdef CONFIG_RESET_CONTROLLER
-	rockchip_pmu_idle_request(pservice->dev, true);
-	rate = clk_get_rate(pservice->aclk_vcodec);
-	/*
-	 * Some old platforms can't run at 300MHZ, they don't request
-	 * decrease the frequency at resetting either. It is safe to
-	 * keep here in 200 MHZ.
-	 */
-	clk_set_rate(pservice->aclk_vcodec, 200 * MHZ);
 
-	try_reset_assert(pservice->rst_niu_a);
-	try_reset_assert(pservice->rst_niu_h);
-	try_reset_assert(pservice->rst_v);
-	try_reset_assert(pservice->rst_a);
-	try_reset_assert(pservice->rst_h);
-	try_reset_assert(pservice->rst_core);
-	try_reset_assert(pservice->rst_cabac);
-	udelay(5);
+	rockchip_save_qos(pservice->dev);
 
-	try_reset_deassert(pservice->rst_niu_h);
-	try_reset_deassert(pservice->rst_niu_a);
-	try_reset_deassert(pservice->rst_v);
-	try_reset_deassert(pservice->rst_h);
-	try_reset_deassert(pservice->rst_a);
-	try_reset_deassert(pservice->rst_core);
-	try_reset_deassert(pservice->rst_cabac);
+	/* rk3328 need to use sip_smc_vpu_reset to reset vpu */
+	if (pservice->hw_ops->reduce_freq == vcodec_reduce_freq_rk3328) {
+		mutex_lock(&pservice->sip_reset_lock);
+		sip_smc_vpu_reset(0, 0, 0);
+		mutex_unlock(&pservice->sip_reset_lock);
+	} else {
+		rockchip_pmu_idle_request(pservice->dev, true);
+		if (pservice->hw_ops->reduce_freq)
+			pservice->hw_ops->reduce_freq(pservice);
 
-	rockchip_pmu_idle_request(pservice->dev, false);
-	clk_set_rate(pservice->aclk_vcodec, rate);
+		try_reset_assert(pservice->rst_niu_a);
+		try_reset_assert(pservice->rst_niu_h);
+		try_reset_assert(pservice->rst_v);
+		try_reset_assert(pservice->rst_a);
+		try_reset_assert(pservice->rst_h);
+		try_reset_assert(pservice->rst_core);
+		try_reset_assert(pservice->rst_cabac);
+		udelay(5);
+
+		try_reset_deassert(pservice->rst_niu_h);
+		try_reset_deassert(pservice->rst_niu_a);
+		try_reset_deassert(pservice->rst_v);
+		try_reset_deassert(pservice->rst_h);
+		try_reset_deassert(pservice->rst_a);
+		try_reset_deassert(pservice->rst_core);
+		try_reset_deassert(pservice->rst_cabac);
+
+		rockchip_pmu_idle_request(pservice->dev, false);
+	}
+
+	rockchip_restore_qos(pservice->dev);
+
 	dev_info(pservice->dev, "reset done\n");
 #endif
 }
@@ -649,22 +741,42 @@ static void vpu_reset(struct vpu_subdev_data *data)
 {
 	struct vpu_service_info *pservice = data->pservice;
 
-	mutex_lock(&pservice->reset_lock);
 	_vpu_reset(data);
-	mutex_unlock(&pservice->reset_lock);
 	if (data->mmu_dev && test_bit(MMU_ACTIVATED, &data->state)) {
 		clear_bit(MMU_ACTIVATED, &data->state);
+		clear_bit(MMU_PAGEFAULT, &data->state);
 		if (atomic_read(&pservice->enabled)) {
 			/* Need to reset iommu */
 			vcodec_iommu_detach(data->iommu_info);
 		} else {
-			/* FIXME BUG_ON should not be used in mass produce */
-			BUG_ON(!atomic_read(&pservice->enabled));
+			WARN_ON(!atomic_read(&pservice->enabled));
+			pr_err("reset mmu when service is disabled, do nothing\n");
 		}
 	}
 
 	atomic_set(&pservice->reset_request, 0);
 	dev_info(pservice->dev, "reset done\n");
+}
+
+static void vpu_soft_reset(struct vpu_subdev_data *data)
+{
+	struct vpu_device *dev = &data->dec_dev;
+	struct vpu_service_info *pservice = data->pservice;
+	struct vpu_task_info *task = &data->task_info[TASK_DEC];
+
+	if (task->reg_reset < 0)
+		return;
+
+	writel(task->reset_mask, dev->regs + task->reg_reset);
+	if (data->mmu_dev && test_bit(MMU_ACTIVATED, &data->state)) {
+		clear_bit(MMU_ACTIVATED, &data->state);
+		clear_bit(MMU_PAGEFAULT, &data->state);
+		if (atomic_read(&pservice->enabled))
+			/* Need to reset iommu */
+			vcodec_iommu_detach(data->iommu_info);
+		else
+			WARN_ON(!atomic_read(&pservice->enabled));
+	}
 }
 
 static void reg_deinit(struct vpu_subdev_data *data, struct vpu_reg *reg);
@@ -684,23 +796,23 @@ static void vpu_service_session_clear(struct vpu_subdev_data *data,
 	}
 }
 
-static void vpu_service_clear(struct vpu_subdev_data *data)
+#if VCODEC_CLOCK_ENABLE
+static unsigned long get_div_rate(struct clk *clock, int divide)
 {
-	struct vpu_reg *reg, *n;
-	struct vpu_session *session, *s;
-	struct vpu_service_info *pservice = data->pservice;
+	struct clk *parent = clk_get_parent(clock);
+	unsigned long rate = clk_get_rate(parent);
 
-	list_for_each_entry_safe(reg, n, &pservice->waiting, status_link) {
-		reg_deinit(reg->data, reg);
-	}
-
-	/* wake up session wait event to prevent the timeout hw reset
-	 * during reboot procedure.
-	 */
-	list_for_each_entry_safe(session, s,
-				 &pservice->session, list_session)
-		wake_up(&session->wait);
+	return (rate / divide) + 1;
 }
+
+static void set_div_clk(struct clk *clock, int divide)
+{
+	struct clk *parent = clk_get_parent(clock);
+	unsigned long rate = clk_get_rate(parent);
+
+	clk_set_rate(clock, (rate / divide) + 1);
+}
+#endif
 
 static void vpu_service_power_off(struct vpu_service_info *pservice)
 {
@@ -730,19 +842,8 @@ static void vpu_service_power_off(struct vpu_service_info *pservice)
 		}
 	}
 	pservice->curr_mode = VCODEC_RUNNING_MODE_NONE;
-	pm_runtime_put(pservice->dev);
-#if VCODEC_CLOCK_ENABLE
-		if (pservice->pd_video)
-			clk_disable_unprepare(pservice->pd_video);
-		if (pservice->hclk_vcodec)
-			clk_disable_unprepare(pservice->hclk_vcodec);
-		if (pservice->aclk_vcodec)
-			clk_disable_unprepare(pservice->aclk_vcodec);
-		if (pservice->clk_core)
-			clk_disable_unprepare(pservice->clk_core);
-		if (pservice->clk_cabac)
-			clk_disable_unprepare(pservice->clk_cabac);
-#endif
+	if (pservice->hw_ops->power_off)
+		pservice->hw_ops->power_off(pservice);
 
 	atomic_add(1, &pservice->power_off_cnt);
 	wake_unlock(&pservice->wake_lock);
@@ -790,19 +891,8 @@ static void vpu_service_power_on(struct vpu_subdev_data *data,
 
 	dev_dbg(pservice->dev, "power on\n");
 
-#if VCODEC_CLOCK_ENABLE
-	if (pservice->aclk_vcodec)
-		clk_prepare_enable(pservice->aclk_vcodec);
-	if (pservice->hclk_vcodec)
-		clk_prepare_enable(pservice->hclk_vcodec);
-	if (pservice->clk_core)
-		clk_prepare_enable(pservice->clk_core);
-	if (pservice->clk_cabac)
-		clk_prepare_enable(pservice->clk_cabac);
-	if (pservice->pd_video)
-		clk_prepare_enable(pservice->pd_video);
-#endif
-	pm_runtime_get_sync(pservice->dev);
+	if (pservice->hw_ops->power_on)
+		pservice->hw_ops->power_on(pservice);
 
 	udelay(5);
 	atomic_add(1, &pservice->power_on_cnt);
@@ -839,7 +929,7 @@ static inline int reg_probe_hevc_y_stride(struct vpu_reg *reg)
 
 static dma_addr_t vcodec_fd_to_iova(struct vpu_subdev_data *data,
 				    struct vpu_session *session,
-				    struct vpu_reg *reg, int fd)
+				    struct vpu_reg *reg, int fd, int idx)
 {
 	int hdl;
 	int ret = 0;
@@ -850,13 +940,13 @@ static dma_addr_t vcodec_fd_to_iova(struct vpu_subdev_data *data,
 		return hdl;
 
 	mem_region = kzalloc(sizeof(*mem_region), GFP_KERNEL);
-	if (mem_region == NULL) {
-		vpu_err("allocate memory for iommu memory region failed\n");
+	if (!mem_region) {
 		vcodec_iommu_free(data->iommu_info, session, hdl);
 		return -ENOMEM;
 	}
 
 	mem_region->hdl = hdl;
+	mem_region->reg_idx = idx;
 	ret = vcodec_iommu_map_iommu(data->iommu_info, session, mem_region->hdl,
 				     &mem_region->iova, &mem_region->len);
 	if (ret < 0) {
@@ -929,17 +1019,18 @@ static int fill_scaling_list_pps(struct vpu_subdev_data *data,
 
 	if (scaling_fd > 0) {
 		int i = 0;
+		u32 val;
 		dma_addr_t tmp = vcodec_fd_to_iova(data, reg->session, reg,
-						   scaling_fd);
+						   scaling_fd, -1);
 
 		if (IS_ERR_VALUE(tmp))
 			return tmp;
 		tmp += scaling_offset;
-		tmp = cpu_to_le32(tmp);
+		val = cpu_to_le32(tmp);
 
 		/* Fill the scaling list address in each pps entries */
 		for (i = 0; i < count; i++, base += pps_info_size)
-			memcpy(pps + base, &tmp, sizeof(tmp));
+			memcpy(pps + base, &val, sizeof(val));
 	}
 
 	dma_buf_vunmap(dmabuf, vaddr);
@@ -952,7 +1043,7 @@ static int fill_scaling_list_pps(struct vpu_subdev_data *data,
 static int vcodec_bufid_to_iova(struct vpu_subdev_data *data,
 				struct vpu_session *session,
 				const u8 *tbl,
-				int size, struct vpu_reg *reg,
+				size_t size, struct vpu_reg *reg,
 				struct extra_info_for_iommu *ext_inf)
 {
 	struct vpu_service_info *pservice = data->pservice;
@@ -960,9 +1051,9 @@ static int vcodec_bufid_to_iova(struct vpu_subdev_data *data,
 	enum FORMAT_TYPE type;
 	int offset = 0;
 	int ret = 0;
-	int i;
+	u32 i;
 
-	if (tbl == NULL || size <= 0) {
+	if (!tbl || size <= 0) {
 		dev_err(pservice->dev, "input arguments invalidate\n");
 		return -EINVAL;
 	}
@@ -1025,8 +1116,10 @@ static int vcodec_bufid_to_iova(struct vpu_subdev_data *data,
 				pps_info_count = 64;
 				pps_info_size = 80;
 				scaling_offset = 74;
+				offset = 0;
 			} break;
 			default: {
+				offset = 0;
 				pps_info_count = 0;
 				pps_info_size = 0;
 				scaling_offset = 0;
@@ -1054,7 +1147,7 @@ static int vcodec_bufid_to_iova(struct vpu_subdev_data *data,
 			}
 		}
 
-		iova = vcodec_fd_to_iova(data, session, reg, usr_fd);
+		iova = vcodec_fd_to_iova(data, session, reg, usr_fd, tbl[i]);
 		if (IS_ERR_VALUE(iova))
 			return iova;
 
@@ -1072,8 +1165,8 @@ static int vcodec_bufid_to_iova(struct vpu_subdev_data *data,
 		reg->reg[tbl[i]] = iova + offset;
 	}
 
-	if (ext_inf != NULL && ext_inf->magic == EXTRA_INFO_MAGIC) {
-		for (i = 0; i < ext_inf->cnt; i++) {
+	if (ext_inf && ext_inf->magic == EXTRA_INFO_MAGIC) {
+		for (i = 0; i < (int)ext_inf->cnt; i++) {
 			vpu_debug(DEBUG_IOMMU, "reg[%d] + offset %d\n",
 				  ext_inf->elem[i].index,
 				  ext_inf->elem[i].offset);
@@ -1096,7 +1189,7 @@ static int vcodec_reg_address_translate(struct vpu_subdev_data *data,
 	if (type < FMT_TYPE_BUTT) {
 		const struct vpu_trans_info *info = &reg->trans[type];
 		const u8 *tbl = info->table;
-		int size = info->count;
+		size_t size = info->count;
 
 		return vcodec_bufid_to_iova(data, session, tbl, size, reg,
 					    ext_inf);
@@ -1104,30 +1197,6 @@ static int vcodec_reg_address_translate(struct vpu_subdev_data *data,
 
 	dev_err(pservice->dev, "found invalid format type!\n");
 	return -EINVAL;
-}
-
-static void get_reg_freq(struct vpu_subdev_data *data, struct vpu_reg *reg)
-{
-
-	if (!of_machine_is_compatible("rockchip,rk2928g")) {
-		if (reg->type == VPU_DEC || reg->type == VPU_DEC_PP) {
-			if (reg_check_fmt(reg) == VPU_DEC_FMT_H264) {
-				if (reg_probe_width(reg) > 3200) {
-					/*raise frequency for 4k avc.*/
-					reg->freq = VPU_FREQ_600M;
-				}
-			} else {
-				if (reg_check_interlace(reg))
-					reg->freq = VPU_FREQ_400M;
-			}
-		}
-		if (data->hw_id == HEVC_ID) {
-			if (reg_probe_hevc_y_stride(reg) > 60000)
-				reg->freq = VPU_FREQ_400M;
-		}
-		if (reg->type == VPU_PP)
-			reg->freq = VPU_FREQ_400M;
-	}
 }
 
 static struct vpu_reg *reg_init(struct vpu_subdev_data *data,
@@ -1178,13 +1247,13 @@ static struct vpu_reg *reg_init(struct vpu_subdev_data *data,
 
 	mutex_lock(&pservice->reset_lock);
 	if (vcodec_reg_address_translate(data, session, reg, &extra_info) < 0) {
-		int i = 0;
+		u32 i = 0;
 
 		mutex_unlock(&pservice->reset_lock);
 		vpu_err("error: translate reg address failed, dumping regs\n");
 		for (i = 0; i < size >> 2; i++)
 			dev_err(pservice->dev, "reg[%02d]: %08x\n",
-				i, *((u32 *)src + i));
+				i, reg->reg[i]);
 
 		kfree(reg);
 		return NULL;
@@ -1196,8 +1265,8 @@ static struct vpu_reg *reg_init(struct vpu_subdev_data *data,
 	list_add_tail(&reg->session_link, &session->waiting);
 	mutex_unlock(&pservice->lock);
 
-	if (pservice->auto_freq)
-		get_reg_freq(data, reg);
+	if (pservice->auto_freq && pservice->hw_ops->get_freq)
+		pservice->hw_ops->get_freq(data, reg);
 
 	vpu_debug_leave();
 
@@ -1218,7 +1287,7 @@ static void reg_deinit(struct vpu_subdev_data *data, struct vpu_reg *reg)
 
 	/* release memory region attach to this registers table. */
 	list_for_each_entry_safe(mem_region, n,
-			&reg->mem_region_list, reg_lnk) {
+				 &reg->mem_region_list, reg_lnk) {
 		vcodec_iommu_unmap_iommu(data->iommu_info, reg->session,
 					 mem_region->hdl);
 		vcodec_iommu_free(data->iommu_info, reg->session,
@@ -1244,7 +1313,7 @@ static void reg_from_wait_to_run(struct vpu_service_info *pservice,
 
 static void reg_copy_from_hw(struct vpu_reg *reg, u32 *src, u32 count)
 {
-	int i;
+	u32 i;
 	u32 *dst = reg->reg;
 
 	vpu_debug_enter();
@@ -1344,51 +1413,12 @@ static void reg_from_run_to_done(struct vpu_subdev_data *data,
 	vpu_debug_leave();
 }
 
-static void vpu_service_set_freq(struct vpu_service_info *pservice,
-				 struct vpu_reg *reg)
-{
-	enum VPU_FREQ curr = atomic_read(&pservice->freq_status);
-
-	if (curr == reg->freq)
-		return;
-
-	atomic_set(&pservice->freq_status, reg->freq);
-	switch (reg->freq) {
-	case VPU_FREQ_200M: {
-		clk_set_rate(pservice->aclk_vcodec, 200 * MHZ);
-	} break;
-	case VPU_FREQ_266M: {
-		clk_set_rate(pservice->aclk_vcodec, 266 * MHZ);
-	} break;
-	case VPU_FREQ_300M: {
-		clk_set_rate(pservice->aclk_vcodec, 300 * MHZ);
-	} break;
-	case VPU_FREQ_400M: {
-		clk_set_rate(pservice->aclk_vcodec, 400 * MHZ);
-	} break;
-	case VPU_FREQ_500M: {
-		clk_set_rate(pservice->aclk_vcodec, 500 * MHZ);
-	} break;
-	case VPU_FREQ_600M: {
-		clk_set_rate(pservice->aclk_vcodec, 600 * MHZ);
-	} break;
-	default: {
-		unsigned long rate = 300*MHZ;
-
-		if (of_machine_is_compatible("rockchip,rk2928g"))
-			rate = 400*MHZ;
-
-		clk_set_rate(pservice->aclk_vcodec, rate);
-	} break;
-	}
-}
-
 static void reg_copy_to_hw(struct vpu_subdev_data *data, struct vpu_reg *reg)
 {
 	struct vpu_service_info *pservice = data->pservice;
 	struct vpu_task_info *task = reg->task;
 	struct vpu_hw_info *hw_info = data->hw_info;
-	int i;
+	u32 i;
 	u32 *src = (u32 *)&reg->reg[0];
 	u32 enable_mask = task->enable_mask;
 	u32 gating_mask = task->gating_mask;
@@ -1399,8 +1429,8 @@ static void reg_copy_to_hw(struct vpu_subdev_data *data, struct vpu_reg *reg)
 	atomic_add(1, &pservice->total_running);
 	atomic_add(1, &reg->session->task_running);
 
-	if (pservice->auto_freq)
-		vpu_service_set_freq(pservice, reg);
+	if (pservice->auto_freq && pservice->hw_ops->set_freq)
+		pservice->hw_ops->set_freq(pservice, reg);
 
 	vcodec_enter_mode(data);
 
@@ -1417,7 +1447,7 @@ static void reg_copy_to_hw(struct vpu_subdev_data *data, struct vpu_reg *reg)
 			  "reg: base %3d end %d en %2d mask: en %x gate %x\n",
 			  base, end, reg_en, enable_mask, gating_mask);
 
-		VEPU_CLEAN_CACHE(dst);
+		VEPU_CLR_CACHE(dst);
 
 		if (debug & DEBUG_SET_REG)
 			for (i = base; i < end; i++)
@@ -1454,14 +1484,25 @@ static void reg_copy_to_hw(struct vpu_subdev_data *data, struct vpu_reg *reg)
 			  "reg: base %3d end %d en %2d mask: en %x gate %x\n",
 			  base, end, reg_en, enable_mask, gating_mask);
 
-		VDPU_CLEAN_CACHE(dst);
-
-		/* on rkvdec set cache size to 64byte */
-		if (pservice->dev_id == VCODEC_DEVICE_ID_RKVDEC) {
+		switch (data->mode) {
+		case VCODEC_RUNNING_MODE_HEVC: {
+			VDEC_CLR_CACHE0(dst);
+		} break;
+		case VCODEC_RUNNING_MODE_RKVDEC: {
+			/* on rkvdec set cache size to 64byte */
 			u32 *cache_base = dst + 0x100;
 			u32 val = (debug & DEBUG_CACHE_32B) ? (0x3) : (0x13);
+
 			writel_relaxed(val, cache_base + 0x07);
 			writel_relaxed(val, cache_base + 0x17);
+
+			VDEC_CLR_CACHE0(dst);
+			VDEC_CLR_CACHE1(dst);
+		} break;
+		case VCODEC_RUNNING_MODE_VPU:
+		default: {
+			VDPU_CLR_CACHE(dst);
+		} break;
 		}
 
 		if (debug & DEBUG_SET_REG)
@@ -1476,6 +1517,9 @@ static void reg_copy_to_hw(struct vpu_subdev_data *data, struct vpu_reg *reg)
 			if (i != reg_en)
 				writel_relaxed(src[i], dst + i);
 		}
+
+		if (pservice->hw_var && pservice->hw_var->config)
+			pservice->hw_var->config(data);
 
 		writel(src[reg_en] | gating_mask, dst + reg_en);
 		dsb(sy);
@@ -1521,7 +1565,7 @@ static void reg_copy_to_hw(struct vpu_subdev_data *data, struct vpu_reg *reg)
 			  base, end, reg_en, enable_mask, gating_mask);
 
 		/* VDPU_SOFT_RESET(dst); */
-		VDPU_CLEAN_CACHE(dst);
+		VDPU_CLR_CACHE(dst);
 
 		if (debug & DEBUG_SET_REG)
 			for (i = base; i < end; i++)
@@ -1542,6 +1586,7 @@ static void reg_copy_to_hw(struct vpu_subdev_data *data, struct vpu_reg *reg)
 	} break;
 	default: {
 		vpu_err("error: unsupport session type %d", reg->type);
+
 		atomic_sub(1, &pservice->total_running);
 		atomic_sub(1, &reg->session->task_running);
 	} break;
@@ -1553,6 +1598,10 @@ static void reg_copy_to_hw(struct vpu_subdev_data *data, struct vpu_reg *reg)
 static void try_set_reg(struct vpu_subdev_data *data)
 {
 	struct vpu_service_info *pservice = data->pservice;
+	int reset_request = atomic_read(&pservice->reset_request);
+	struct vpu_reg *reg_codec = pservice->reg_codec;
+	struct vpu_reg *reg_pproc = pservice->reg_pproc;
+	bool change_able = (!reg_codec) && (!reg_pproc);
 
 	vpu_debug_enter();
 
@@ -1561,51 +1610,29 @@ static void try_set_reg(struct vpu_subdev_data *data)
 		mutex_unlock(&pservice->shutdown_lock);
 		return;
 	}
+
+	if (change_able && reset_request) {
+		vpu_service_power_on(data, pservice);
+		mutex_lock(&pservice->reset_lock);
+		vpu_reset(data);
+		mutex_unlock(&pservice->reset_lock);
+	}
+
 	if (!list_empty(&pservice->waiting)) {
-		struct vpu_reg *reg_codec = pservice->reg_codec;
-		struct vpu_reg *reg_pproc = pservice->reg_pproc;
 		int can_set = 0;
-		bool change_able = (reg_codec == NULL) && (reg_pproc == NULL);
-		int reset_request = atomic_read(&pservice->reset_request);
 		struct vpu_reg *reg = list_entry(pservice->waiting.next,
 				struct vpu_reg, status_link);
 
 		vpu_service_power_on(data, pservice);
 
-		if (change_able || !reset_request) {
+		if (change_able) {
 			switch (reg->type) {
-			case VPU_ENC: {
-				if (change_able)
-					can_set = 1;
-			} break;
-			case VPU_DEC: {
-				if (reg_codec == NULL)
-					can_set = 1;
-				if (pservice->auto_freq && (reg_pproc != NULL))
-					can_set = 0;
-			} break;
-			case VPU_PP: {
-				if (reg_codec == NULL) {
-					if (reg_pproc == NULL)
-						can_set = 1;
-				} else {
-					if ((reg_codec->type == VPU_DEC) &&
-					    (reg_pproc == NULL))
-						can_set = 1;
-
-					/*
-					 * NOTE:
-					 * can not charge frequency
-					 * when vpu is working
-					 */
-					if (pservice->auto_freq)
-						can_set = 0;
-				}
-			} break;
+			case VPU_ENC:
+			case VPU_DEC:
+			case VPU_PP:
 			case VPU_DEC_PP: {
-				if (change_able)
-					can_set = 1;
-				} break;
+				can_set = 1;
+			} break;
 			default: {
 				dev_err(pservice->dev,
 					"undefined reg type %d\n",
@@ -1614,18 +1641,13 @@ static void try_set_reg(struct vpu_subdev_data *data)
 			}
 		}
 
-		/* then check reset request */
-		if (reset_request && !change_able)
-			reset_request = 0;
-
-		/* do reset before setting registers */
-		if (reset_request)
-			vpu_reset(data);
-
 		if (can_set) {
 			reg_from_wait_to_run(pservice, reg);
 			reg_copy_to_hw(reg->data, reg);
 		}
+	} else {
+		if (pservice->hw_ops->reduce_freq)
+			pservice->hw_ops->reduce_freq(pservice);
 	}
 
 	mutex_unlock(&pservice->shutdown_lock);
@@ -1696,18 +1718,17 @@ static long vpu_service_ioctl(struct file *filp, unsigned int cmd,
 	vpu_debug(DEBUG_IOCTL, "cmd %x, VPU_IOC_SET_CLIENT_TYPE %x\n", cmd,
 		  (u32)VPU_IOC_SET_CLIENT_TYPE);
 
-	if (NULL == session)
+	if (!session)
 		return -EINVAL;
 
 	switch (cmd) {
 	case VPU_IOC_SET_CLIENT_TYPE: {
 		int secure_mode;
 
-		secure_mode = (arg & 0xffff0000) >> 16;
-		session->type = (enum VPU_CLIENT_TYPE)(arg & 0xffff);
+		secure_mode = arg >> 16;
 		atomic_set(&pservice->secure_mode, secure_mode);
 
-		session->type = (enum VPU_CLIENT_TYPE)arg;
+		session->type = (enum VPU_CLIENT_TYPE)(arg & 0xffff);
 		vpu_debug(DEBUG_IOCTL, "pid %d set client type %d, secure mode = %d\n",
 			  session->pid, session->type, secure_mode);
 	} break;
@@ -1719,7 +1740,8 @@ static long vpu_service_ioctl(struct file *filp, unsigned int cmd,
 		if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
 			vpu_err("error: get hw status copy_from_user failed\n");
 			return -EFAULT;
-		} else {
+		}
+		{
 			void *config = (session->type != VPU_ENC) ?
 				       ((void *)&pservice->dec_config) :
 				       ((void *)&pservice->enc_config);
@@ -1757,11 +1779,10 @@ static long vpu_service_ioctl(struct file *filp, unsigned int cmd,
 		}
 
 		reg = reg_init(data, session, (void __user *)req.req, req.size);
-		if (NULL == reg) {
+		if (!reg)
 			return -EFAULT;
-		} else {
-			queue_work(pservice->set_workq, &data->set_work);
-		}
+
+		queue_work(pservice->set_workq, &data->set_work);
 	} break;
 	case VPU_IOC_GET_REG: {
 		struct vpu_request req;
@@ -1771,14 +1792,12 @@ static long vpu_service_ioctl(struct file *filp, unsigned int cmd,
 		vpu_debug(DEBUG_IOCTL, "pid %d get reg type %d\n",
 			  session->pid, session->type);
 
-		if (atomic_read(&pservice->secure_mode) == 1) {
+		if (atomic_read(&pservice->secure_mode)) {
 			ret = wait_event_timeout(session->wait,
 						 pservice->secure_isr,
 						 VPU_TIMEOUT_DELAY);
-			if (ret < 0) {
+			if (ret < 0)
 				pr_info("warning: secure wait timeout\n");
-				ret = 0;
-			}
 			pservice->secure_isr = false;
 			break;
 		}
@@ -1792,6 +1811,9 @@ static long vpu_service_ioctl(struct file *filp, unsigned int cmd,
 		ret = wait_event_timeout(session->wait,
 					 !list_empty(&session->done),
 					 VPU_TIMEOUT_DELAY);
+
+		while (atomic_read(&pservice->reset_request))
+			msleep(10);
 
 		if (!list_empty(&session->done)) {
 			if (ret < 0)
@@ -1813,6 +1835,11 @@ static long vpu_service_ioctl(struct file *filp, unsigned int cmd,
 		if (ret < 0) {
 			int task_running = atomic_read(&session->task_running);
 
+			/*
+			 * if reaching here, no irq return, and need to do
+			 * vpu_reset immediately. there is no need to care
+			 * reset_lock at this situation.
+			 */
 			mutex_lock(&pservice->lock);
 			if (task_running) {
 				atomic_set(&session->task_running, 0);
@@ -1822,7 +1849,6 @@ static long vpu_service_ioctl(struct file *filp, unsigned int cmd,
 					"%d task is running but not return, reset hardware...",
 					task_running);
 				vpu_reset(data);
-				dev_err(pservice->dev, "done\n");
 			}
 			vpu_service_session_clear(data, session);
 			mutex_unlock(&pservice->lock);
@@ -1847,8 +1873,20 @@ static long vpu_service_ioctl(struct file *filp, unsigned int cmd,
 			return -EFAULT;
 		}
 	} break;
+	case VPU_IOC_SET_DRIVER_DATA: {
+		u32 val;
+
+		if (copy_from_user(&val, (void __user *)arg,
+				   sizeof(int))) {
+			vpu_err("error: COMPAT_VPU_IOC_SET_DRIVER_DATA copy_from_user failed\n");
+			return -EFAULT;
+		}
+
+		if (pservice->grf)
+			regmap_write(pservice->grf, 0x5d8, val);
+	} break;
 	default: {
-		vpu_err("error: unknow vpu service ioctl cmd %x\n", cmd);
+		vpu_err("error: unknown vpu service ioctl cmd %x\n", cmd);
 		return -ENOIOCTLCMD;
 	} break;
 	}
@@ -1866,6 +1904,7 @@ static long vpu_service_ioctl(struct file *filp, unsigned int cmd,
 #define VPU_IOC_GET_REG32                  _IOW(VPU_IOC_MAGIC, 4, \
 						compat_ulong_t)
 #define VPU_IOC_PROBE_IOMMU_STATUS32       _IOR(VPU_IOC_MAGIC, 5, u32)
+#define VPU_IOC_SET_DRIVER_DATA32		_IOW(VPU_IOC_MAGIC, 64, u32)
 
 static long native_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -1904,6 +1943,9 @@ static long compat_vpu_service_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case VPU_IOC_PROBE_IOMMU_STATUS32:
 		cmd = VPU_IOC_PROBE_IOMMU_STATUS;
+		break;
+	case VPU_IOC_SET_DRIVER_DATA32:
+		cmd = VPU_IOC_SET_DRIVER_DATA;
 		break;
 	}
 
@@ -1944,11 +1986,12 @@ static long compat_vpu_service_ioctl(struct file *file, unsigned int cmd,
 
 static int vpu_service_check_hw(struct vpu_subdev_data *data)
 {
-	int ret = -EINVAL, i = 0;
 	u32 hw_id = readl_relaxed(data->regs);
+	u32 i = 0;
+	int ret = -EINVAL;
 
 	hw_id = (hw_id >> 16) & 0xFFFF;
-	dev_info(data->dev, "checking hw id %x\n", hw_id);
+	dev_dbg(data->dev, "checking hw id %x\n", hw_id);
 	data->hw_info = NULL;
 
 	for (i = 0; i < ARRAY_SIZE(vcodec_info_set); i++) {
@@ -1976,10 +2019,8 @@ static int vpu_service_open(struct inode *inode, struct file *filp)
 	vpu_debug_enter();
 
 	session = kzalloc(sizeof(*session), GFP_KERNEL);
-	if (!session) {
-		vpu_err("error: unable to allocate memory for vpu_session.");
+	if (!session)
 		return -ENOMEM;
-	}
 
 	data->iommu_info->debug_level = debug;
 
@@ -2010,7 +2051,7 @@ static int vpu_service_release(struct inode *inode, struct file *filp)
 	struct vpu_session *session = (struct vpu_session *)filp->private_data;
 
 	vpu_debug_enter();
-	if (NULL == session)
+	if (!session)
 		return -EINVAL;
 
 	task_running = atomic_read(&session->task_running);
@@ -2039,7 +2080,7 @@ static int vpu_service_release(struct inode *inode, struct file *filp)
 	filp->private_data = NULL;
 	mutex_unlock(&pservice->lock);
 
-	dev_info(pservice->dev, "closed\n");
+	dev_dbg(pservice->dev, "closed\n");
 	vpu_debug_leave();
 	return 0;
 }
@@ -2081,6 +2122,330 @@ static struct device *rockchip_get_sysmmu_dev(const char *compt)
 	return ret;
 }
 
+/* special hw ops */
+static void vcodec_power_on_default(struct vpu_service_info *pservice)
+{
+#if VCODEC_CLOCK_ENABLE
+	if (pservice->aclk_vcodec)
+		clk_prepare_enable(pservice->aclk_vcodec);
+	if (pservice->hclk_vcodec)
+		clk_prepare_enable(pservice->hclk_vcodec);
+	if (pservice->clk_core)
+		clk_prepare_enable(pservice->clk_core);
+	if (pservice->clk_cabac)
+		clk_prepare_enable(pservice->clk_cabac);
+	if (pservice->pd_video)
+		clk_prepare_enable(pservice->pd_video);
+#endif
+	pm_runtime_get_sync(pservice->dev);
+}
+
+static void vcodec_power_on_rk312x(struct vpu_service_info *pservice)
+{
+#define BIT_VCODEC_CLK_SEL	BIT(10)
+	if (of_machine_is_compatible("rockchip,rk3126") ||
+	    of_machine_is_compatible("rockchip,rk3128"))
+		regmap_write(pservice->grf, RK312X_GRF_SOC_CON1,
+			     BIT_VCODEC_CLK_SEL |
+			     (BIT_VCODEC_CLK_SEL << 16));
+
+	vcodec_power_on_default(pservice);
+}
+
+static void vcodec_power_on_rk322x(struct vpu_service_info *pservice)
+{
+	struct devfreq_dev_status *stat;
+	unsigned long rate = 300 * MHZ;
+
+	if (pservice->dev_id == VCODEC_DEVICE_ID_RKVDEC)
+		rate = 500 * MHZ;
+
+	if (pservice->devfreq) {
+		stat = &pservice->devfreq->last_status;
+		stat->busy_time = 1;
+		stat->total_time = 1;
+		rkvdec_dvfs_set_clk(pservice,
+				    rate,
+				    300 * MHZ,
+				    300 * MHZ);
+	} else {
+		clk_set_rate(pservice->aclk_vcodec, rate);
+		clk_set_rate(pservice->clk_core, 300 * MHZ);
+		clk_set_rate(pservice->clk_cabac, 300 * MHZ);
+	}
+
+	vcodec_power_on_default(pservice);
+}
+
+static void vcodec_power_on_rk3328(struct vpu_service_info *pservice)
+{
+	struct devfreq_dev_status *stat;
+
+	if (pservice->devfreq) {
+		stat = &pservice->devfreq->last_status;
+		stat->busy_time = 1;
+		stat->total_time = 1;
+		rkvdec_dvfs_set_clk(pservice,
+				    RK3328_VCODEC_RATE_ON,
+				    RK3328_CODE_RATE_ON,
+				    RK3328_CABAC_RATE_ON);
+	} else {
+		clk_set_rate(pservice->aclk_vcodec, RK3328_VCODEC_RATE_ON);
+		clk_set_rate(pservice->clk_core, RK3328_CODE_RATE_ON);
+		clk_set_rate(pservice->clk_cabac, RK3328_CABAC_RATE_ON);
+	}
+
+	vcodec_power_on_default(pservice);
+}
+
+static void vcodec_power_off_default(struct vpu_service_info *pservice)
+{
+	if (pservice->pd_video)
+		clk_disable_unprepare(pservice->pd_video);
+	if (pservice->hclk_vcodec)
+		clk_disable_unprepare(pservice->hclk_vcodec);
+	if (pservice->aclk_vcodec)
+		clk_disable_unprepare(pservice->aclk_vcodec);
+	if (pservice->clk_core)
+		clk_disable_unprepare(pservice->clk_core);
+	if (pservice->clk_cabac)
+		clk_disable_unprepare(pservice->clk_cabac);
+	pm_runtime_put(pservice->dev);
+}
+
+static void vcodec_power_off_rk322x(struct vpu_service_info *pservice)
+{
+	struct devfreq_dev_status *stat;
+
+	vcodec_power_off_default(pservice);
+
+	if (pservice->devfreq) {
+		stat = &pservice->devfreq->last_status;
+		stat->busy_time = 0;
+		stat->total_time = 1;
+		rkvdec_dvfs_set_clk(pservice,
+				    get_div_rate(pservice->aclk_vcodec, 32),
+				    get_div_rate(pservice->clk_core, 32),
+				    get_div_rate(pservice->clk_cabac, 32));
+	} else {
+		clk_set_rate(pservice->aclk_vcodec,
+			     get_div_rate(pservice->aclk_vcodec, 32));
+		clk_set_rate(pservice->clk_core,
+			     get_div_rate(pservice->clk_core, 32));
+		clk_set_rate(pservice->clk_cabac,
+			     get_div_rate(pservice->clk_cabac, 32));
+	}
+}
+
+static void vcodec_power_off_rk3328(struct vpu_service_info *pservice)
+{
+	struct devfreq_dev_status *stat;
+
+	vcodec_power_off_default(pservice);
+
+	if (pservice->devfreq) {
+		stat = &pservice->devfreq->last_status;
+		stat->busy_time = 0;
+		stat->total_time = 1;
+		rkvdec_dvfs_set_clk(pservice,
+				    RK3328_VCODEC_RATE_OFF,
+				    RK3328_CODE_RATE_OFF,
+				    RK3328_CABAC_RATE_OFF);
+	} else {
+		clk_set_rate(pservice->aclk_vcodec, RK3328_VCODEC_RATE_OFF);
+		clk_set_rate(pservice->clk_core, RK3328_CODE_RATE_OFF);
+		clk_set_rate(pservice->clk_cabac, RK3328_CABAC_RATE_OFF);
+	}
+}
+
+static void vcodec_get_reg_freq_default(struct vpu_subdev_data *data,
+					struct vpu_reg *reg)
+{
+	reg->freq = VPU_FREQ_300M;
+
+	if (data->hw_id == HEVC_ID) {
+		if (reg_probe_hevc_y_stride(reg) > 60000)
+			reg->freq = VPU_FREQ_400M;
+	}
+
+	if (reg->type == VPU_PP)
+		reg->freq = VPU_FREQ_400M;
+}
+
+static void vcodec_get_reg_freq_rk3288(struct vpu_subdev_data *data,
+				       struct vpu_reg *reg)
+{
+	vcodec_get_reg_freq_default(data, reg);
+
+	if ((reg->type == VPU_DEC || reg->type == VPU_DEC_PP) &&
+	    data->hw_id != HEVC_ID) {
+		if (reg_check_fmt(reg) == VPU_DEC_FMT_H264) {
+			if (reg_probe_width(reg) > 2560) {
+				/*
+				 * raise frequency for resolution larger
+				 * than 1440p avc.
+				 */
+				reg->freq = VPU_FREQ_600M;
+			}
+		} else if (reg_check_interlace(reg)) {
+			reg->freq = VPU_FREQ_400M;
+		}
+	}
+}
+
+static void vcodec_set_freq_default(struct vpu_service_info *pservice,
+				    struct vpu_reg *reg)
+{
+	enum VPU_FREQ curr = atomic_read(&pservice->freq_status);
+
+	if (curr == reg->freq)
+		return;
+
+	atomic_set(&pservice->freq_status, reg->freq);
+	switch (reg->freq) {
+	case VPU_FREQ_200M: {
+		clk_set_rate(pservice->aclk_vcodec, 200 * MHZ);
+	} break;
+	case VPU_FREQ_266M: {
+		clk_set_rate(pservice->aclk_vcodec, 266 * MHZ);
+	} break;
+	case VPU_FREQ_300M: {
+		clk_set_rate(pservice->aclk_vcodec, 300 * MHZ);
+	} break;
+	case VPU_FREQ_400M: {
+		clk_set_rate(pservice->aclk_vcodec, 400 * MHZ);
+	} break;
+	case VPU_FREQ_500M: {
+		clk_set_rate(pservice->aclk_vcodec, 500 * MHZ);
+	} break;
+	case VPU_FREQ_600M: {
+		clk_set_rate(pservice->aclk_vcodec, 600 * MHZ);
+	} break;
+	default: {
+		clk_set_rate(pservice->aclk_vcodec,
+			     pservice->aclk_vcodec_default_rate);
+		clk_set_rate(pservice->clk_core,
+			     pservice->clk_core_default_rate);
+		clk_set_rate(pservice->clk_cabac,
+			     pservice->clk_cabac_default_rate);
+		break;
+	}
+	}
+}
+
+static void rkvdec_set_clk(struct vpu_service_info *pservice,
+			   unsigned long vcodec_rate,
+			   unsigned long core_rate,
+			   unsigned long cabac_rate,
+			   unsigned int event)
+{
+	mutex_lock(&pservice->set_clk_lock);
+
+	switch (event) {
+	case EVENT_POWER_ON:
+		clk_set_rate(pservice->aclk_vcodec, pservice->vcodec_rate);
+		clk_set_rate(pservice->clk_core, pservice->core_rate);
+		clk_set_rate(pservice->clk_cabac, pservice->cabac_rate);
+		pservice->thermal_div = 0;
+		break;
+	case EVENT_POWER_OFF:
+		clk_set_rate(pservice->aclk_vcodec, vcodec_rate);
+		clk_set_rate(pservice->clk_core, core_rate);
+		clk_set_rate(pservice->clk_cabac, cabac_rate);
+		pservice->thermal_div = 0;
+		break;
+	case EVENT_ADJUST:
+		if (!pservice->thermal_div) {
+			clk_set_rate(pservice->aclk_vcodec, vcodec_rate);
+			clk_set_rate(pservice->clk_core, core_rate);
+			clk_set_rate(pservice->clk_cabac, cabac_rate);
+		} else {
+			clk_set_rate(pservice->aclk_vcodec,
+				     vcodec_rate / pservice->thermal_div);
+			clk_set_rate(pservice->clk_core,
+				     core_rate / pservice->thermal_div);
+			clk_set_rate(pservice->clk_cabac,
+				     cabac_rate / pservice->thermal_div);
+		}
+		pservice->vcodec_rate = vcodec_rate;
+		pservice->core_rate = core_rate;
+		pservice->cabac_rate = cabac_rate;
+		break;
+	case EVENT_THERMAL:
+		pservice->thermal_div = pservice->vcodec_rate / vcodec_rate;
+		if (pservice->thermal_div > 4)
+			pservice->thermal_div = 4;
+		if (pservice->thermal_div) {
+			clk_set_rate(pservice->aclk_vcodec,
+				     pservice->vcodec_rate /
+				     pservice->thermal_div);
+			clk_set_rate(pservice->clk_core,
+				     pservice->core_rate /
+				     pservice->thermal_div);
+			clk_set_rate(pservice->clk_cabac,
+				     pservice->cabac_rate /
+				     pservice->thermal_div);
+		}
+		break;
+	}
+
+	mutex_unlock(&pservice->set_clk_lock);
+}
+
+static void vcodec_set_freq_rk3328(struct vpu_service_info *pservice,
+				   struct vpu_reg *reg)
+{
+	enum VPU_FREQ curr = atomic_read(&pservice->freq_status);
+
+	if (curr == reg->freq)
+		return;
+
+	if (pservice->dev_id == VCODEC_DEVICE_ID_RKVDEC) {
+		if (reg->reg[1] & 0x00800000) {
+			if (rkv_dec_get_fmt(reg->reg) == FMT_H264D)
+				rkvdec_set_clk(pservice, 400 * MHZ, 250 * MHZ,
+					       400 * MHZ, EVENT_ADJUST);
+			else
+				rkvdec_set_clk(pservice, 500 * MHZ, 250 * MHZ,
+					       400 * MHZ, EVENT_ADJUST);
+		} else {
+			if (rkv_dec_get_fmt(reg->reg) == FMT_H264D)
+				rkvdec_set_clk(pservice, 400 * MHZ, 300 * MHZ,
+					       400 * MHZ, EVENT_ADJUST);
+			else
+				rkvdec_set_clk(pservice, 500 * MHZ, 300 * MHZ,
+					       400 * MHZ, EVENT_ADJUST);
+		}
+	}
+}
+
+static void vcodec_set_freq_rk322x(struct vpu_service_info *pservice,
+				   struct vpu_reg *reg)
+{
+	enum VPU_FREQ curr = atomic_read(&pservice->freq_status);
+
+	if (curr == reg->freq)
+		return;
+
+	/*
+	 * special process for rk322x
+	 * rk322x rkvdec has more clocks to set
+	 * vpu/vpu2 still only need to set aclk
+	 */
+	if (pservice->dev_id == VCODEC_DEVICE_ID_RKVDEC) {
+		if (pservice->devfreq) {
+			rkvdec_set_clk(pservice,  500 * MHZ, 300 * MHZ,
+				       300 * MHZ, EVENT_ADJUST);
+		} else {
+			clk_set_rate(pservice->clk_core,  300 * MHZ);
+			clk_set_rate(pservice->clk_cabac, 300 * MHZ);
+			clk_set_rate(pservice->aclk_vcodec, 500 * MHZ);
+		}
+	} else {
+		clk_set_rate(pservice->aclk_vcodec, 300 * MHZ);
+	}
+}
+
 #ifdef CONFIG_IOMMU_API
 static inline void platform_set_sysmmu(struct device *iommu,
 				       struct device *dev)
@@ -2094,90 +2459,289 @@ static inline void platform_set_sysmmu(struct device *iommu,
 }
 #endif
 
-int vcodec_sysmmu_fault_hdl(struct device *dev,
-			    enum rk_iommu_inttype itype,
-			    unsigned long pgtable_base,
-			    unsigned long fault_addr, unsigned int status)
+#define IOMMU_GET_BUS_ID(x)    (((x) >> 6) & 0x1f)
+
+static int
+_vcodec_sys_fault_hdl(struct device *dev, unsigned long iova, int status)
 {
 	struct platform_device *pdev;
 	struct vpu_service_info *pservice;
 	struct vpu_subdev_data *data;
+	struct vpu_session *session = NULL;
 
 	vpu_debug_enter();
 
-	if (dev == NULL) {
+	if (!dev) {
 		pr_err("invalid NULL dev\n");
 		return 0;
 	}
 
 	pdev = container_of(dev, struct platform_device, dev);
-	if (pdev == NULL) {
+	if (!pdev) {
 		pr_err("invalid NULL platform_device\n");
 		return 0;
 	}
 
 	data = platform_get_drvdata(pdev);
-	if (data == NULL) {
+	if (!data) {
 		pr_err("invalid NULL vpu_subdev_data\n");
 		return 0;
 	}
 
 	pservice = data->pservice;
-	if (pservice == NULL) {
+	if (!pservice) {
 		pr_err("invalid NULL vpu_service_info\n");
 		return 0;
 	}
 
+	session = list_first_entry(&pservice->session,
+				   struct vpu_session, list_session);
+
 	if (pservice->reg_codec) {
 		struct vpu_reg *reg = pservice->reg_codec;
-		struct vcodec_mem_region *mem, *n;
-		int i = 0;
+		struct vcodec_mem_region *mem = NULL, *n = NULL;
+		u32 i = 0;
 
-		pr_err("vcodec, fault addr 0x%08lx\n", fault_addr);
-		if (!list_empty(&reg->mem_region_list))
+		dev_err(dev, "vcodec, fault addr 0x%08lx status %x\n", iova,
+			status);
+		if (!list_empty(&reg->mem_region_list)) {
 			list_for_each_entry_safe(mem, n, &reg->mem_region_list,
 						 reg_lnk) {
-				dev_err(dev, "reg[%02u] mem region [%02d] %pad %lx\n",
-					mem->reg_idx, i, &mem->iova, mem->len);
+				unsigned long tmp_iova = mem->iova;
+
+				dev_err(dev, "vcodec, reg[%3d] mem region [%02d] 0x%lx %lx\n",
+					mem->reg_idx, i, tmp_iova, mem->len);
 				i++;
 			}
-		else
+		} else {
 			dev_err(dev, "no memory region mapped\n");
+		}
 
 		if (reg->data) {
 			struct vpu_subdev_data *data = reg->data;
-			u32 *base = (u32 *)data->dec_dev.regs;
-			u32 len = data->hw_info->dec_reg_num;
+			u32 *base;
+			u32 len;
 
-			dev_err(dev, "current errror register set:\n");
+			if (reg->session->type == VPU_ENC) {
+				base = (u32 *)data->enc_dev.regs;
+				len = data->hw_info->enc_reg_num;
+				dev_err(dev, "dumping enc register set:\n");
+			} else {
+				base = (u32 *)data->dec_dev.regs;
+				len = data->hw_info->dec_reg_num;
+				dev_err(dev, "dumping dec register set:\n");
+			}
 
 			for (i = 0; i < len; i++)
-				pr_err("reg[%02d] %08x\n",
-				       i, readl_relaxed(base + i));
+				dev_err(dev, "reg[%02d] %08x\n",
+					i, readl_relaxed(base + i));
 		}
 
-		dev_alert(dev, "page fault occur, reset hw\n");
+		set_bit(MMU_PAGEFAULT, &data->state);
 
-		/* reg->reg[101] = 1; */
-		_vpu_reset(data);
+		/*
+		 * defeat workaround, invalidate address generated when rk322x
+		 * vdec pre-fetch colmv data.
+		 */
+		if (IOMMU_GET_BUS_ID(status) == 2 && data->pa_hdl >= 0) {
+			/* avoid another page fault occur after page fault */
+			if (data->pa_iova != (unsigned long)-1)
+				vcodec_iommu_unmap_iommu_with_iova
+					(data->iommu_info, session,
+					 data->pa_hdl);
+
+			/* get the page align iova */
+			data->pa_iova = round_down(iova, IOMMU_PAGE_SIZE);
+
+			vcodec_iommu_map_iommu_with_iova(data->iommu_info,
+							 session,
+							 data->pa_hdl,
+							 data->pa_iova,
+							 IOMMU_PAGE_SIZE);
+		} else {
+			clear_bit(MMU_PAGEFAULT, &data->state);
+		}
 	}
 
 	return 0;
 }
 
+static int vcodec_iommu_fault_hdl(struct iommu_domain *iommu,
+				  struct device *iommu_dev,
+				  unsigned long iova, int status, void *arg)
+{
+	struct device *dev = (struct device *)arg;
+
+	return _vcodec_sys_fault_hdl(dev, iova, status);
+}
+
+static int vcodec_iovmm_fault_hdl(struct device *dev,
+				  enum rk_iommu_inttype itype,
+				  unsigned long pgtable_base,
+				  unsigned long fault_addr, unsigned int status)
+{
+	return _vcodec_sys_fault_hdl(dev, fault_addr, status);
+}
+
+static void vcodec_reduce_freq_rk322x(struct vpu_service_info *pservice)
+{
+	if (list_empty(&pservice->running)) {
+		unsigned long rate = clk_get_rate(pservice->aclk_vcodec);
+
+		if (pservice->devfreq) {
+			rkvdec_set_clk(pservice,
+				get_div_rate(pservice->aclk_vcodec, 32),
+				get_div_rate(pservice->clk_core, 32),
+				get_div_rate(pservice->clk_cabac, 32),
+				EVENT_ADJUST);
+		} else {
+			if (pservice->aclk_vcodec)
+				set_div_clk(pservice->aclk_vcodec, 32);
+			if (pservice->clk_core)
+				set_div_clk(pservice->clk_core, 32);
+			if (pservice->clk_cabac)
+				set_div_clk(pservice->clk_cabac, 32);
+		}
+
+		atomic_set(&pservice->freq_status, rate / 32);
+	}
+}
+
+static void vcodec_reduce_freq_rk3328(struct vpu_service_info *pservice)
+{
+	if (list_empty(&pservice->running))
+		rkvdec_set_clk(pservice, 100 * MHZ, 100 * MHZ, 100 * MHZ,
+			       EVENT_ADJUST);
+}
+
+static int vcodec_spec_init_rk3328(struct vpu_service_info *pservice)
+{
+	/* todo */
+
+	return 0;
+}
+
+static void vcodec_spec_config_rk3328(struct vpu_subdev_data *data)
+{
+	u32 *dst = data->dec_dev.regs;
+	struct vpu_reg *reg = data->pservice->reg_codec;
+	u32 cfg;
+
+	/*
+	 * HW defeat workaround: VP9 power save optimization cause decoding
+	 * corruption, disable optimization here.
+	 */
+	if (rkv_dec_get_fmt(reg->reg) == FMT_VP9D) {
+		cfg = readl(dst + 99);
+		writel(cfg & (~(1 << 12)), dst + 99);
+	}
+}
+
+static struct vcodec_hw_ops hw_ops_default = {
+	.power_on = vcodec_power_on_default,
+	.power_off = vcodec_power_off_default,
+	.get_freq = vcodec_get_reg_freq_default,
+	.set_freq = vcodec_set_freq_default,
+	.reduce_freq = NULL,
+};
+
+static struct vcodec_hw_ops hw_ops_rk3328_rkvdec = {
+	.power_on = vcodec_power_on_rk3328,
+	.power_off = vcodec_power_off_rk3328,
+	.get_freq = vcodec_get_reg_freq_default,
+	.set_freq = vcodec_set_freq_rk3328,
+	.reduce_freq = vcodec_reduce_freq_rk3328,
+};
+
+static struct vcodec_hw_var rk3328_rkvdec_var = {
+	.device_type = VCODEC_DEVICE_TYPE_RKVD,
+	.name = "rkvdec",
+	.ops = &hw_ops_rk3328_rkvdec,
+	.init = vcodec_spec_init_rk3328,
+	.config = vcodec_spec_config_rk3328,
+};
+
+static struct vcodec_hw_var rk3328_vpucombo_var = {
+	.device_type = VCODEC_DEVICE_TYPE_VPUC,
+	.name = "vpu-combo",
+	.ops = NULL,
+	.init = NULL,
+	.config = NULL,
+};
+
+/* Both VPU1 and VPU2 */
+static struct vcodec_hw_var vpu_device_info = {
+	.device_type = VCODEC_DEVICE_TYPE_VPUX,
+	.name = "vpu-service",
+	.ops = NULL,
+	.init = NULL,
+	.config = NULL,
+};
+
+static struct vcodec_hw_var vpu_combo_device_info = {
+	.device_type = VCODEC_DEVICE_TYPE_VPUC,
+	.name = "vpu-combo",
+	.ops = NULL,
+	.init = NULL,
+	.config = NULL,
+};
+
+static struct vcodec_hw_var hevc_device_info = {
+	.device_type = VCODEC_DEVICE_TYPE_HEVC,
+	.name = "hevc-service",
+	.ops = NULL,
+	.init = NULL,
+	.config = NULL,
+};
+
+static struct vcodec_hw_var rkvd_device_info = {
+	.device_type = VCODEC_DEVICE_TYPE_RKVD,
+	.name = "rkvdec",
+	.ops = NULL,
+	.init = NULL,
+	.config = NULL,
+};
+
+static void vcodec_set_hw_ops(struct vpu_service_info *pservice)
+{
+	if (pservice->hw_var)
+		pservice->hw_ops = pservice->hw_var->ops;
+
+	if (!pservice->hw_ops) {
+		pservice->hw_ops = &hw_ops_default;
+		if (of_machine_is_compatible("rockchip,rk3328") ||
+		    of_machine_is_compatible("rockchip,rk3228") ||
+		    of_machine_is_compatible("rockchip,rk3229")) {
+			pservice->hw_ops->power_on = vcodec_power_on_rk322x;
+			pservice->hw_ops->power_off = vcodec_power_off_rk322x;
+			pservice->hw_ops->get_freq = NULL;
+			pservice->hw_ops->set_freq = vcodec_set_freq_rk322x;
+			pservice->hw_ops->reduce_freq =
+						vcodec_reduce_freq_rk322x;
+		} else if (of_machine_is_compatible("rockchip,rk3126") ||
+				of_machine_is_compatible("rockchip,rk3128")) {
+			pservice->hw_ops->power_on = vcodec_power_on_rk312x;
+		} else if (of_machine_is_compatible("rockchip,rk3288") ||
+				of_machine_is_compatible("rockchip,rk3288w")) {
+			pservice->hw_ops->get_freq = vcodec_get_reg_freq_rk3288;
+		}
+	}
+}
+
 static int vcodec_subdev_probe(struct platform_device *pdev,
 			       struct vpu_service_info *pservice)
 {
-	uint8_t *regs = NULL;
-	int32_t ret = 0;
-	uint32_t ioaddr = 0;
-	struct resource *res = NULL;
+	u8 *regs = NULL;
+	s32 ret = 0;
 	struct vpu_hw_info *hw_info = NULL;
 	struct device *dev = &pdev->dev;
 	struct device_node *np = pdev->dev.of_node;
 	struct vpu_subdev_data *data = NULL;
 	struct platform_device *sub_dev = NULL;
 	struct device_node *sub_np = NULL;
+	struct vpu_session *session = list_first_entry(&pservice->session,
+						       struct vpu_session,
+						       list_session);
 	const char *name  = np->name;
 	char mmu_dev_dts_name[40];
 
@@ -2189,6 +2753,7 @@ static int vcodec_subdev_probe(struct platform_device *pdev,
 
 	data->pservice = pservice;
 	data->dev = dev;
+	platform_set_drvdata(pdev, data);
 
 	INIT_WORK(&data->set_work, vpu_set_register_work);
 
@@ -2209,16 +2774,14 @@ static int vcodec_subdev_probe(struct platform_device *pdev,
 	}
 
 	if (!pservice->reg_base) {
-		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-		data->regs = devm_ioremap_resource(dev, res);
+		data->res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		data->regs = devm_ioremap_resource(dev, data->res);
 		if (IS_ERR(data->regs)) {
 			ret = PTR_ERR(data->regs);
 			goto err;
 		}
-		ioaddr = res->start;
 	} else {
 		data->regs = pservice->reg_base;
-		ioaddr = pservice->ioaddr;
 	}
 
 	sub_np = of_parse_phandle(np, "iommus", 0);
@@ -2251,16 +2814,15 @@ static int vcodec_subdev_probe(struct platform_device *pdev,
 			platform_set_sysmmu(data->mmu_dev, dev);
 
 		rockchip_iovmm_set_fault_handler
-			(dev, vcodec_sysmmu_fault_hdl);
+			(dev, vcodec_iovmm_fault_hdl);
 	}
-
-	dev_info(dev, "vpu mmu dec %p\n", data->mmu_dev);
 
 #define BIT_VCODEC_CLK_SEL	BIT(10)
 	if (of_machine_is_compatible("rockchip,rk3126") ||
 	    of_machine_is_compatible("rockchip,rk3128"))
 		regmap_write(pservice->grf, RK312X_GRF_SOC_CON1,
-			BIT_VCODEC_CLK_SEL | (BIT_VCODEC_CLK_SEL << 16));
+			     BIT_VCODEC_CLK_SEL |
+			     (BIT_VCODEC_CLK_SEL << 16));
 
 	clear_bit(MMU_ACTIVATED, &data->state);
 	vpu_service_power_on(data, pservice);
@@ -2268,14 +2830,33 @@ static int vcodec_subdev_probe(struct platform_device *pdev,
 	of_property_read_u32(np, "allocator", (u32 *)&pservice->alloc_type);
 	data->iommu_info = vcodec_iommu_info_create(dev, data->mmu_dev,
 						    pservice->alloc_type);
-	dev_info(dev, "allocator is %s\n", pservice->alloc_type == 1 ? "drm" :
-		(pservice->alloc_type == 2 ? "ion" : "null"));
+	dev_info(dev, "%s allocator with mmu %s\n",
+		 pservice->alloc_type == 1 ? "drm" :
+		 (pservice->alloc_type == 2 ? "ion" : "null"),
+		 data->mmu_dev ? "enabled" : "disabled");
+	if (pservice->alloc_type == 1) {
+		struct vcodec_iommu_drm_info *drm_info =
+			data->iommu_info->private;
+		iommu_set_fault_handler(drm_info->domain,
+					vcodec_iommu_fault_hdl, dev);
+	}
 	vcodec_enter_mode(data);
 	ret = vpu_service_check_hw(data);
 	if (ret < 0) {
 		dev_err(dev, "error: hw info check failed\n");
 		goto err;
 	}
+	data->pa_hdl = vcodec_iommu_alloc(data->iommu_info,
+					  session, 4096, 4096);
+
+	if (data->pa_hdl < 0) {
+		dev_err(dev, "allocate page fault hdl failed\n");
+		return -1;
+	}
+
+	vcodec_iommu_map_iommu(data->iommu_info, session,
+			       data->pa_hdl, NULL, NULL);
+	data->pa_iova = (unsigned long)-1;
 	vcodec_exit_mode(data);
 
 	hw_info = data->hw_info;
@@ -2355,8 +2936,6 @@ static int vcodec_subdev_probe(struct platform_device *pdev,
 	data->child_dev = device_create(data->cls, dev,
 		data->dev_t, NULL, "%s", name);
 
-	platform_set_drvdata(pdev, data);
-
 	INIT_LIST_HEAD(&data->lnk_service);
 	list_add_tail(&data->lnk_service, &pservice->subdev_list);
 
@@ -2378,22 +2957,56 @@ err:
 	return -1;
 }
 
-static void vcodec_subdev_remove(struct vpu_subdev_data *data)
+static void vcodec_subdev_remove(struct platform_device *pdev)
 {
+	struct vpu_subdev_data *data = platform_get_drvdata(pdev);
 	struct vpu_service_info *pservice = data->pservice;
+	struct device *dev = &pdev->dev;
 
-	vcodec_iommu_info_destroy(data->iommu_info);
-	data->iommu_info = NULL;
-
+	/* Insure device is power off and detached */
 	mutex_lock(&pservice->lock);
+	cancel_work_sync(&data->set_work);
 	cancel_delayed_work_sync(&pservice->power_off_work);
 	vpu_service_power_off(pservice);
 	mutex_unlock(&pservice->lock);
 
+	if (data->iommu_info) {
+		struct vpu_session *session =
+			list_first_entry(&pservice->session, struct vpu_session,
+					 list_session);
+
+		vcodec_iommu_clear(data->iommu_info, session);
+		vcodec_iommu_info_destroy(data->iommu_info);
+		data->iommu_info = NULL;
+	}
+
+	if (data->irq_enc > 0)
+		devm_free_irq(dev, data->irq_enc, (void *)data);
+
+	if (data->irq_dec > 0)
+		devm_free_irq(dev, data->irq_dec, (void *)data);
+
+	if (data->mmu_dev) {
+		platform_set_sysmmu(NULL, dev);
+		data->mmu_dev = NULL;
+	}
+
+	if (!pservice->reg_base && data->regs) {
+		struct resource *res = data->res;
+
+		devm_iounmap(dev, data->regs);
+		devm_release_mem_region(dev, res->start, resource_size(res));
+		data->regs = NULL;
+	}
+
 	device_destroy(data->cls, data->dev_t);
-	class_destroy(data->cls);
 	cdev_del(&data->cdev);
 	unregister_chrdev_region(data->dev_t, 1);
+	class_destroy(data->cls);
+
+	dev_info(dev, "removed");
+	platform_set_drvdata(pdev, NULL);
+	devm_kfree(dev, data);
 }
 
 static void vcodec_read_property(struct device_node *np,
@@ -2402,6 +3015,8 @@ static void vcodec_read_property(struct device_node *np,
 	pservice->mode_bit = 0;
 	pservice->mode_ctrl = 0;
 	pservice->subcnt = 0;
+	pservice->sub_pdev[0] = NULL;
+	pservice->sub_pdev[1] = NULL;
 
 	of_property_read_u32(np, "subcnt", &pservice->subcnt);
 
@@ -2409,6 +3024,10 @@ static void vcodec_read_property(struct device_node *np,
 		of_property_read_u32(np, "mode_bit", &pservice->mode_bit);
 		of_property_read_u32(np, "mode_ctrl", &pservice->mode_ctrl);
 	}
+	WARN_ON(pservice->subcnt > MAX_VCODEC_SUBDEV_COUNT);
+	/* Limit sub-device count to not larger than 2 */
+	if (pservice->subcnt > MAX_VCODEC_SUBDEV_COUNT)
+		pservice->subcnt = MAX_VCODEC_SUBDEV_COUNT;
 
 	pservice->grf = syscon_regmap_lookup_by_phandle(np, "rockchip,grf");
 	if (IS_ERR_OR_NULL(pservice->grf)) {
@@ -2467,193 +3086,15 @@ static void vcodec_read_property(struct device_node *np,
 	of_property_read_string(np, "name", (const char **)&pservice->name);
 }
 
-static void vcodec_init_drvdata(struct vpu_service_info *pservice)
-{
-	pservice->dev_id = VCODEC_DEVICE_ID_VPU;
-	pservice->curr_mode = -1;
-
-	wake_lock_init(&pservice->wake_lock, WAKE_LOCK_SUSPEND, "vpu");
-	INIT_LIST_HEAD(&pservice->waiting);
-	INIT_LIST_HEAD(&pservice->running);
-	mutex_init(&pservice->lock);
-	mutex_init(&pservice->shutdown_lock);
-	mutex_init(&pservice->reset_lock);
-	atomic_set(&pservice->service_on, 1);
-
-	INIT_LIST_HEAD(&pservice->done);
-	INIT_LIST_HEAD(&pservice->session);
-	INIT_LIST_HEAD(&pservice->subdev_list);
-
-	pservice->reg_pproc	= NULL;
-	atomic_set(&pservice->total_running, 0);
-	atomic_set(&pservice->enabled,       0);
-	atomic_set(&pservice->power_on_cnt,  0);
-	atomic_set(&pservice->power_off_cnt, 0);
-	atomic_set(&pservice->reset_request, 0);
-
-	INIT_DELAYED_WORK(&pservice->power_off_work, vpu_power_off_work);
-	pservice->last.tv64 = 0;
-
-	pservice->alloc_type = 0;
-}
-
-static int vcodec_probe(struct platform_device *pdev)
-{
-	int i;
-	int ret = 0;
-	struct resource *res = NULL;
-	struct device *dev = &pdev->dev;
-	struct device_node *np = pdev->dev.of_node;
-	struct vpu_service_info *pservice = NULL;
-	struct vcodec_device_info *driver_data;
-
-	pservice = devm_kzalloc(dev, sizeof(struct vpu_service_info),
-				GFP_KERNEL);
-	if (!pservice)
-		return -ENOMEM;
-	pservice->dev = dev;
-
-	pservice->set_workq = create_singlethread_workqueue("vcodec");
-	if (!pservice->set_workq) {
-		dev_err(dev, "failed to create workqueue\n");
-		return -ENOMEM;
-	}
-
-	driver_data = vcodec_get_drv_data(pdev);
-	if (!driver_data)
-		return -EINVAL;
-
-	vcodec_read_property(np, pservice);
-	vcodec_init_drvdata(pservice);
-
-	/* Underscore for label, hyphens for name */
-	switch (driver_data->device_type) {
-	case VCODEC_DEVICE_TYPE_VPUX:
-		pservice->dev_id = VCODEC_DEVICE_ID_VPU;
-		break;
-	case VCODEC_DEVICE_TYPE_VPUC:
-		pservice->dev_id = VCODEC_DEVICE_ID_COMBO;
-		break;
-	case VCODEC_DEVICE_TYPE_HEVC:
-		pservice->dev_id = VCODEC_DEVICE_ID_HEVC;
-		break;
-	case VCODEC_DEVICE_TYPE_RKVD:
-		pservice->dev_id = VCODEC_DEVICE_ID_RKVDEC;
-		break;
-	default:
-		dev_err(dev, "unsupported device type\n");
-		return -ENODEV;
-	}
-
-	pservice->secure_isr = false;
-	pservice->secure_irq_status = true;
-
-	if (0 > vpu_get_clk(pservice))
-		goto err;
-
-	if (of_property_read_bool(np, "reg")) {
-		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-
-		pservice->reg_base = devm_ioremap_resource(pservice->dev, res);
-		if (IS_ERR(pservice->reg_base)) {
-			vpu_err("ioremap registers base failed\n");
-			ret = PTR_ERR(pservice->reg_base);
-			goto err;
-		}
-		pservice->ioaddr = res->start;
-	} else {
-		pservice->reg_base = 0;
-	}
-
-	pm_runtime_enable(dev);
-
-	if (of_property_read_bool(np, "subcnt")) {
-		struct vpu_subdev_data *data = NULL;
-
-		data = devm_kzalloc(dev, sizeof(struct vpu_subdev_data),
-				    GFP_KERNEL);
-		if (!data)
-			return -ENOMEM;
-
-		for (i = 0; i < pservice->subcnt; i++) {
-			struct device_node *sub_np;
-			struct platform_device *sub_pdev;
-
-			sub_np = of_parse_phandle(np, "rockchip,sub", i);
-			sub_pdev = of_find_device_by_node(sub_np);
-
-			vcodec_subdev_probe(sub_pdev, pservice);
-		}
-		data->pservice = pservice;
-		platform_set_drvdata(pdev, data);
-	} else {
-		vcodec_subdev_probe(pdev, pservice);
-	}
-
-	dev_info(dev, "init success\n");
-
-	return 0;
-
-err:
-	dev_info(dev, "init failed\n");
-	destroy_workqueue(pservice->set_workq);
-	wake_lock_destroy(&pservice->wake_lock);
-
-	return ret;
-}
-
-static int vcodec_remove(struct platform_device *pdev)
-{
-	struct vpu_subdev_data *data = platform_get_drvdata(pdev);
-
-	vcodec_subdev_remove(data);
-
-	pm_runtime_disable(data->pservice->dev);
-
-	return 0;
-}
-
-static void vcodec_shutdown(struct platform_device *pdev)
-{
-	struct vpu_subdev_data *data = platform_get_drvdata(pdev);
-	struct vpu_service_info *pservice = data->pservice;
-	struct device_node *np = pdev->dev.of_node;
-	int val;
-	int ret;
-	int i;
-
-	dev_info(&pdev->dev, "vcodec shutdown");
-
-	mutex_lock(&pservice->shutdown_lock);
-	atomic_set(&pservice->service_on, 0);
-	mutex_unlock(&pservice->shutdown_lock);
-
-	ret = readx_poll_timeout(atomic_read,
-				 &pservice->total_running,
-				 val, val == 0, 20000, 200000);
-	if (ret == -ETIMEDOUT)
-		dev_err(&pdev->dev, "wait total running time out\n");
-
-	vcodec_exit_mode(data);
-	vpu_service_clear(data);
-	if (of_property_read_bool(np, "subcnt")) {
-		for (i = 0; i < pservice->subcnt; i++) {
-			struct device_node *sub_np;
-			struct platform_device *sub_pdev;
-
-			sub_np = of_parse_phandle(np, "rockchip,sub", i);
-			sub_pdev = of_find_device_by_node(sub_np);
-			vcodec_subdev_remove(platform_get_drvdata(sub_pdev));
-		}
-
-	} else {
-		vcodec_subdev_remove(data);
-	}
-
-	pm_runtime_disable(&pdev->dev);
-}
-
 static const struct of_device_id vcodec_service_dt_ids[] = {
+	{
+		.compatible = "rockchip,rk3328-rkvdec",
+		.data = &rk3328_rkvdec_var,
+	},
+	{
+		.compatible = "rockchip,rk3328-vpu-combo",
+		.data = &rk3328_vpucombo_var,
+	},
 	{
 		.compatible = "rockchip,vpu_service",
 		.data = &vpu_device_info,
@@ -2673,19 +3114,549 @@ static const struct of_device_id vcodec_service_dt_ids[] = {
 	{},
 };
 
-MODULE_DEVICE_TABLE(of, vcodec_service_dt_ids);
-
-static void *vcodec_get_drv_data(struct platform_device *pdev)
+static void vcodec_init_drvdata(struct vpu_service_info *pservice)
 {
-	struct vcodec_device_info *driver_data = NULL;
-	const struct of_device_id *match;
+	pservice->dev_id = VCODEC_DEVICE_ID_VPU;
+	pservice->curr_mode = -1;
 
-	match = of_match_node(vcodec_service_dt_ids, pdev->dev.of_node);
-	if (match)
-		driver_data = (struct vcodec_device_info *)match->data;
+	wake_lock_init(&pservice->wake_lock, WAKE_LOCK_SUSPEND, "vpu");
+	INIT_LIST_HEAD(&pservice->waiting);
+	INIT_LIST_HEAD(&pservice->running);
+	mutex_init(&pservice->lock);
+	mutex_init(&pservice->shutdown_lock);
+	mutex_init(&pservice->reset_lock);
+	mutex_init(&pservice->sip_reset_lock);
+	mutex_init(&pservice->set_clk_lock);
+	atomic_set(&pservice->service_on, 1);
 
-	return driver_data;
+	INIT_LIST_HEAD(&pservice->done);
+	INIT_LIST_HEAD(&pservice->session);
+	INIT_LIST_HEAD(&pservice->subdev_list);
+
+	pservice->reg_pproc	= NULL;
+	atomic_set(&pservice->total_running, 0);
+	atomic_set(&pservice->enabled,       0);
+	atomic_set(&pservice->power_on_cnt,  0);
+	atomic_set(&pservice->power_off_cnt, 0);
+	atomic_set(&pservice->reset_request, 0);
+
+	INIT_DELAYED_WORK(&pservice->power_off_work, vpu_power_off_work);
+	pservice->last.tv64 = 0;
+
+	pservice->alloc_type = 0;
+
+	vcodec_set_hw_ops(pservice);
+	if (pservice->hw_var && pservice->hw_var->init)
+		pservice->hw_var->init(pservice);
 }
+
+static int devfreq_vcodec_target(struct device *dev, unsigned long *freq,
+				 u32 flags)
+{
+	struct vpu_subdev_data *data = dev_get_drvdata(dev);
+	struct vpu_service_info *pservice = data->pservice;
+	struct devfreq *devfreq = pservice->devfreq;
+	struct devfreq_dev_status *stat = &devfreq->last_status;
+	struct dev_pm_opp *opp;
+	unsigned long old_clk_rate = stat->current_frequency;
+	unsigned long target_volt, target_rate;
+	unsigned long vcodec_rate, core_rate, cabac_rate;
+	unsigned long req_rate = *freq;
+	unsigned int clk_event;
+	int ret = 0;
+
+	rcu_read_lock();
+
+	opp = devfreq_recommended_opp(dev, freq, flags);
+	if (IS_ERR(opp)) {
+		rcu_read_unlock();
+		return PTR_ERR(opp);
+	}
+	target_rate = dev_pm_opp_get_freq(opp);
+	target_volt = dev_pm_opp_get_voltage(opp);
+
+	rcu_read_unlock();
+
+	if (target_rate < req_rate) {
+		clk_event = EVENT_THERMAL;
+		vcodec_rate = target_rate;
+		core_rate = target_rate;
+		cabac_rate = target_rate;
+	} else {
+		clk_event = stat->busy_time ? EVENT_POWER_ON : EVENT_POWER_OFF;
+		vcodec_rate = pservice->vcodec_rate;
+		core_rate = pservice->core_rate;
+		cabac_rate = pservice->cabac_rate;
+	}
+
+	if (old_clk_rate == target_rate) {
+		if (pservice->volt == target_volt)
+			return ret;
+		ret = regulator_set_voltage(pservice->vdd_vcodec, target_volt,
+					    INT_MAX);
+		if (ret) {
+			dev_err(dev, "Cannot set voltage %lu uV\n",
+				target_volt);
+			return ret;
+		}
+		pservice->volt = target_volt;
+		return 0;
+	}
+
+	if (old_clk_rate < target_rate) {
+		ret = regulator_set_voltage(pservice->vdd_vcodec, target_volt,
+					    INT_MAX);
+		if (ret) {
+			dev_err(dev, "Cannot set voltage %lu uV\n",
+				target_volt);
+			return ret;
+		}
+	}
+
+	dev_dbg(dev, "%lu-->%lu\n", old_clk_rate, target_rate);
+	rkvdec_set_clk(pservice, vcodec_rate, core_rate, cabac_rate, clk_event);
+
+	stat->current_frequency = target_rate;
+
+	if (old_clk_rate > target_rate) {
+		ret = regulator_set_voltage(pservice->vdd_vcodec, target_volt,
+					    INT_MAX);
+		if (ret) {
+			dev_err(dev, "Cannot set vol %lu uV\n", target_volt);
+			return ret;
+		}
+	}
+
+	pservice->volt = target_volt;
+
+	return ret;
+}
+
+static int devfreq_vcodec_get_cur_freq(struct device *dev,
+				       unsigned long *freq)
+{
+	struct vpu_subdev_data *data = dev_get_drvdata(dev);
+	struct vpu_service_info *pservice = data->pservice;
+
+	*freq = clk_get_rate(pservice->aclk_vcodec);
+
+	return 0;
+}
+
+static int devfreq_vcodec_get_dev_status(struct device *dev,
+					 struct devfreq_dev_status *stat)
+{
+	return 0;
+}
+
+static struct devfreq_dev_profile devfreq_vcodec_profile = {
+	.target		= devfreq_vcodec_target,
+	.get_cur_freq	= devfreq_vcodec_get_cur_freq,
+	.get_dev_status	= devfreq_vcodec_get_dev_status,
+};
+
+static unsigned long model_static_power(struct devfreq *devfreq,
+					unsigned long voltage)
+{
+	struct device *dev = devfreq->dev.parent;
+	struct vpu_subdev_data *data = dev_get_drvdata(dev);
+	struct vpu_service_info *pservice = data->pservice;
+
+	int temperature;
+	unsigned long temp;
+	unsigned long temp_squared, temp_cubed, temp_scaling_factor;
+	const unsigned long voltage_cubed = (voltage * voltage * voltage) >> 10;
+
+	if (!IS_ERR_OR_NULL(pservice->vcodec_tz) &&
+	    pservice->vcodec_tz->ops->get_temp) {
+		int ret;
+
+		ret = pservice->vcodec_tz->ops->get_temp(pservice->vcodec_tz,
+							 &temperature);
+		if (ret) {
+			dev_warn_ratelimited(dev,
+					     "failed to read temp for ddr thermal zone: %d\n",
+					     ret);
+			temperature = FALLBACK_STATIC_TEMPERATURE;
+		}
+	} else {
+		temperature = FALLBACK_STATIC_TEMPERATURE;
+	}
+
+	/*
+	 * Calculate the temperature scaling factor. To be applied to the
+	 * voltage scaled power.
+	 */
+	temp = temperature / 1000;
+	temp_squared = temp * temp;
+	temp_cubed = temp_squared * temp;
+	temp_scaling_factor = (pservice->ts[3] * temp_cubed)
+	    + (pservice->ts[2] * temp_squared)
+	    + (pservice->ts[1] * temp)
+	    + pservice->ts[0];
+
+	return (((pservice->static_coefficient * voltage_cubed) >> 20)
+		* temp_scaling_factor) / 1000000;
+}
+
+static struct devfreq_cooling_power vcodec_cooling_power_data = {
+	.get_static_power = model_static_power,
+	.dyn_power_coeff = 120,
+};
+
+static int vcodec_power_model_simple_init(struct vpu_service_info *pservice)
+{
+	struct device_node *power_model_node;
+	const char *tz_name;
+	u32 temp;
+
+	power_model_node = of_get_child_by_name(pservice->dev->of_node,
+						"vcodec_power_model");
+	if (!power_model_node) {
+		dev_err(pservice->dev, "could not find power_model node\n");
+		return -ENODEV;
+	}
+
+	if (of_property_read_string(power_model_node, "thermal-zone",
+				    &tz_name)) {
+		dev_err(pservice->dev, "ts in power_model not available\n");
+		return -EINVAL;
+	}
+
+	pservice->vcodec_tz = thermal_zone_get_zone_by_name(tz_name);
+	if (IS_ERR(pservice->vcodec_tz)) {
+		pr_warn_ratelimited
+		    ("Error getting ddr thermal zone (%ld), not yet ready?\n",
+		     PTR_ERR(pservice->vcodec_tz));
+		pservice->vcodec_tz = NULL;
+
+		return -EPROBE_DEFER;
+	}
+
+	if (of_property_read_u32(power_model_node, "static-power-coefficient",
+				 &pservice->static_coefficient)) {
+		dev_err(pservice->dev,
+			"static-power-coefficient not available\n");
+		return -EINVAL;
+	}
+	if (of_property_read_u32(power_model_node, "dynamic-power-coefficient",
+				 &temp)) {
+		dev_err(pservice->dev,
+			"dynamic-power-coefficient not available\n");
+		return -EINVAL;
+	}
+	vcodec_cooling_power_data.dyn_power_coeff = (unsigned long)temp;
+
+	if (of_property_read_u32_array
+	    (power_model_node, "ts", (u32 *)pservice->ts, 4)) {
+		dev_err(pservice->dev, "ts in power_model not available\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int vcodec_devfreq_notifier_call(struct notifier_block *nb,
+					unsigned long event,
+					void *data)
+{
+	struct vpu_service_info *ps = container_of(nb, struct vpu_service_info,
+						   devfreq_nb);
+
+	if (!ps)
+		return NOTIFY_OK;
+
+	if (event == DEVFREQ_PRECHANGE)
+		mutex_lock(&ps->sip_reset_lock);
+	else if (event == DEVFREQ_POSTCHANGE)
+		mutex_unlock(&ps->sip_reset_lock);
+
+	return NOTIFY_OK;
+}
+
+static int vcodec_probe(struct platform_device *pdev)
+{
+	int ret = 0;
+	const struct of_device_id *match = NULL;
+	struct resource *res = NULL;
+	struct device *dev = &pdev->dev;
+	struct device_node *np = pdev->dev.of_node;
+	struct device_node *parent_np;
+	struct devfreq_dev_profile *devp = &devfreq_vcodec_profile;
+	struct devfreq_dev_status *stat;
+	struct vpu_service_info *pservice = NULL;
+	struct vpu_session *session = NULL;
+
+	pservice = devm_kzalloc(dev, sizeof(struct vpu_service_info),
+				GFP_KERNEL);
+	if (!pservice)
+		return -ENOMEM;
+	pservice->dev = dev;
+
+	pservice->vdd_vcodec = devm_regulator_get_optional(dev, "vcodec");
+	if (IS_ERR(pservice->vdd_vcodec)) {
+		ret = PTR_ERR(pservice->vdd_vcodec);
+		if (ret == -EPROBE_DEFER) {
+			dev_warn(dev, "vcodec regulator not ready, retry\n");
+			return ret;
+		}
+		dev_warn(dev, "no regulator for vcodec\n");
+	}
+
+	match = of_match_node(vcodec_service_dt_ids, pservice->dev->of_node);
+	if (match)
+		pservice->hw_var = match->data;
+	else
+		return -EINVAL;
+
+	if (pservice->hw_var->ops &&
+	    pservice->hw_var->ops->reduce_freq == vcodec_reduce_freq_rk3328) {
+		pservice->parent_devfreq = devfreq_get_devfreq_by_phandle(dev,
+									  0);
+		if (IS_ERR(pservice->parent_devfreq)) {
+			ret = PTR_ERR(pservice->parent_devfreq);
+			if (ret == -EPROBE_DEFER) {
+				parent_np = of_parse_phandle(np, "devfreq", 0);
+				if (parent_np &&
+				    of_device_is_available(parent_np)) {
+					dev_warn(dev,
+						 "parent devfreq retry\n");
+					return ret;
+				}
+				dev_warn(dev, "parent devfreq is disabled\n");
+				pservice->parent_devfreq = NULL;
+			} else {
+				dev_err(dev, "parent devfreq is error\n");
+				return -EINVAL;
+			}
+		} else {
+			dev_info(dev, "parent devfreq is ok\n");
+		}
+	}
+
+	pservice->set_workq = create_singlethread_workqueue("vcodec");
+	if (!pservice->set_workq) {
+		dev_err(dev, "failed to create workqueue\n");
+		return -ENOMEM;
+	}
+
+	vcodec_read_property(np, pservice);
+	vcodec_init_drvdata(pservice);
+
+	if (pservice->parent_devfreq) {
+		pservice->devfreq_nb.notifier_call =
+			vcodec_devfreq_notifier_call;
+		devm_devfreq_register_notifier(dev,
+					       pservice->parent_devfreq,
+					       &pservice->devfreq_nb,
+					       DEVFREQ_TRANSITION_NOTIFIER);
+	}
+
+	/* Underscore for label, hyphens for name */
+	switch (pservice->hw_var->device_type) {
+	case VCODEC_DEVICE_TYPE_VPUX:
+		pservice->dev_id = VCODEC_DEVICE_ID_VPU;
+		break;
+	case VCODEC_DEVICE_TYPE_VPUC:
+		pservice->dev_id = VCODEC_DEVICE_ID_COMBO;
+		break;
+	case VCODEC_DEVICE_TYPE_HEVC:
+		pservice->dev_id = VCODEC_DEVICE_ID_HEVC;
+		break;
+	case VCODEC_DEVICE_TYPE_RKVD:
+		pservice->dev_id = VCODEC_DEVICE_ID_RKVDEC;
+		break;
+	default:
+		dev_err(dev, "unsupported device type\n");
+		ret = -ENODEV;
+		goto err;
+	}
+
+	pservice->secure_isr = false;
+	pservice->secure_irq_status = true;
+
+	if (vpu_get_clk(pservice) < 0)
+		goto err;
+
+	if (!IS_ERR(pservice->vdd_vcodec)) {
+		ret = rockchip_init_opp_table(dev, NULL,
+					      "rkvdec_leakage", "vcodec");
+		if (ret) {
+			dev_err(dev, "Failed to init_opp_table (%d)\n", ret);
+			return ret;
+		}
+		pservice->devfreq = devm_devfreq_add_device(dev, devp,
+							    "userspace", NULL);
+		if (IS_ERR(pservice->devfreq)) {
+			ret = PTR_ERR(pservice->devfreq);
+			goto err;
+		}
+
+		stat = &pservice->devfreq->last_status;
+		stat->current_frequency = clk_get_rate(pservice->aclk_vcodec);
+
+		ret = devfreq_register_opp_notifier(dev, pservice->devfreq);
+		if (ret)
+			goto err;
+	}
+
+	if (of_property_read_bool(np, "reg")) {
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+
+		pservice->reg_base = devm_ioremap_resource(pservice->dev, res);
+		if (IS_ERR(pservice->reg_base)) {
+			vpu_err("ioremap registers base failed\n");
+			ret = PTR_ERR(pservice->reg_base);
+			goto err;
+		}
+		pservice->ioaddr = res->start;
+	} else {
+		pservice->reg_base = 0;
+	}
+
+	pm_runtime_enable(dev);
+
+	/*
+	 * this session is global session, each dev
+	 * only has one global session, and will be
+	 * release when dev remove
+	 */
+	session = kzalloc(sizeof(*session), GFP_KERNEL);
+	if (!session) {
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	session->type	= VPU_TYPE_BUTT;
+	session->pid	= current->pid;
+	INIT_LIST_HEAD(&session->waiting);
+	INIT_LIST_HEAD(&session->running);
+	INIT_LIST_HEAD(&session->done);
+	INIT_LIST_HEAD(&session->list_session);
+	init_waitqueue_head(&session->wait);
+	atomic_set(&session->task_running, 0);
+	mutex_lock(&pservice->lock);
+	list_add_tail(&session->list_session, &pservice->session);
+	mutex_unlock(&pservice->lock);
+
+	if (pservice->subcnt) {
+		u32 i;
+		struct vpu_subdev_data *data = NULL;
+
+		data = devm_kzalloc(dev, sizeof(struct vpu_subdev_data),
+				    GFP_KERNEL);
+		if (!data) {
+			ret = -ENOMEM;
+			goto err;
+		}
+
+		data->pservice = pservice;
+		platform_set_drvdata(pdev, data);
+
+		/* NOTE: only has max 2 sub device */
+		for (i = 0; i < pservice->subcnt; i++) {
+			struct device_node *sub_np;
+			struct platform_device *sub_pdev;
+
+			sub_np = of_parse_phandle(np, "rockchip,sub", i);
+			sub_pdev = of_find_device_by_node(sub_np);
+			pservice->sub_pdev[i] = sub_pdev;
+
+			vcodec_subdev_probe(sub_pdev, pservice);
+		}
+	} else {
+		vcodec_subdev_probe(pdev, pservice);
+	}
+
+	ret = vcodec_power_model_simple_init(pservice);
+
+	if (!ret && pservice->devfreq) {
+		pservice->devfreq_cooling = of_devfreq_cooling_register_power
+			(pservice->dev->of_node, pservice->devfreq,
+			 &vcodec_cooling_power_data);
+		if (IS_ERR_OR_NULL(pservice->devfreq_cooling)) {
+			ret = PTR_ERR(pservice->devfreq_cooling);
+			dev_err(pservice->dev,
+				"Failed to register cooling device (%d)\n",
+				ret);
+		}
+	}
+
+	dev_info(dev, "init success\n");
+
+	return 0;
+
+err:
+	dev_info(dev, "init failed\n");
+	kfree(session);
+	destroy_workqueue(pservice->set_workq);
+	wake_lock_destroy(&pservice->wake_lock);
+
+	return ret;
+}
+
+static int vcodec_remove(struct platform_device *pdev)
+{
+	struct vpu_subdev_data *data = platform_get_drvdata(pdev);
+	struct vpu_service_info *pservice = data->pservice;
+	struct vpu_session *session = list_first_entry(&pservice->session,
+						       struct vpu_session,
+						       list_session);
+
+	/* Stop workqueue first */
+	if (pservice->set_workq) {
+		destroy_workqueue(pservice->set_workq);
+		pservice->set_workq = NULL;
+	}
+
+	/* Then remove sub device */
+	if (pservice->subcnt) {
+		u32 i;
+
+		for (i = 0; i < pservice->subcnt; i++)
+			vcodec_subdev_remove(pservice->sub_pdev[i]);
+	} else {
+		vcodec_subdev_remove(pdev);
+	}
+
+	kfree(session);
+
+	devfreq_unregister_opp_notifier(&pdev->dev, pservice->devfreq);
+	dev_pm_opp_of_remove_table(&pdev->dev);
+
+	pm_runtime_disable(data->pservice->dev);
+	wake_lock_destroy(&pservice->wake_lock);
+
+	return 0;
+}
+
+static void vcodec_shutdown(struct platform_device *pdev)
+{
+	struct vpu_subdev_data *data = platform_get_drvdata(pdev);
+	struct vpu_service_info *pservice = data->pservice;
+	int val;
+	int ret;
+
+	dev_info(&pdev->dev, "shutdown");
+
+	/*
+	 * just wait for hardware finishing his work
+	 * and do nothing else.
+	 */
+	mutex_lock(&pservice->shutdown_lock);
+	atomic_set(&pservice->service_on, 0);
+	mutex_unlock(&pservice->shutdown_lock);
+
+	ret = readx_poll_timeout(atomic_read,
+				 &pservice->total_running,
+				 val, val == 0, 20000, 200000);
+	if (ret == -ETIMEDOUT)
+		dev_err(&pdev->dev, "wait total running time out\n");
+
+	data->pservice->curr_mode = VCODEC_RUNNING_MODE_NONE;
+}
+
+MODULE_DEVICE_TABLE(of, vcodec_service_dt_ids);
 
 static struct platform_driver vcodec_driver = {
 	.probe = vcodec_probe,
@@ -2744,6 +3715,7 @@ static void get_hw_info(struct vpu_subdev_data *data)
 		pservice->bug_dec_addr = of_machine_is_compatible
 			("rockchip,rk30xx");
 		break;
+	case VCODEC_RUNNING_MODE_HEVC:
 	case VCODEC_RUNNING_MODE_RKVDEC:
 		pservice->auto_freq = true;
 		atomic_set(&pservice->freq_status, VPU_FREQ_BUT);
@@ -2764,6 +3736,16 @@ static void get_hw_info(struct vpu_subdev_data *data)
 	} else {
 		dec->max_dec_pic_width = 4096;
 	}
+
+	/* in 3399 3228 and 3229 chips, avoid vpu timeout
+	 * and can't recover problem
+	 */
+	if (of_machine_is_compatible("rockchip,rk3399") ||
+		of_machine_is_compatible("rockchip,rk3228") ||
+		of_machine_is_compatible("rockchip,rk3229"))
+		pservice->soft_reset = true;
+	else
+		pservice->soft_reset = false;
 }
 
 static bool check_irq_err(struct vpu_task_info *task, u32 irq_status)
@@ -2859,6 +3841,9 @@ static irqreturn_t vdpu_isr(int irq, void *dev_id)
 	struct vpu_subdev_data *data = (struct vpu_subdev_data *)dev_id;
 	struct vpu_service_info *pservice = data->pservice;
 	struct vpu_device *dev = &data->dec_dev;
+	struct vpu_session *session = list_first_entry(&pservice->session,
+						       struct vpu_session,
+						       list_session);
 
 	if (atomic_read(&pservice->secure_mode))
 		return IRQ_HANDLED;
@@ -2866,19 +3851,26 @@ static irqreturn_t vdpu_isr(int irq, void *dev_id)
 	mutex_lock(&pservice->lock);
 	if (atomic_read(&dev->irq_count_codec)) {
 		atomic_sub(1, &dev->irq_count_codec);
-		if (pservice->reg_codec == NULL) {
+		if (!pservice->reg_codec) {
 			vpu_err("error: dec isr with no task waiting\n");
 		} else {
+			if (test_bit(MMU_PAGEFAULT, &data->state) &&
+			    data->pa_iova != (unsigned long)-1) {
+				vcodec_iommu_unmap_iommu_with_iova
+					(data->iommu_info, session,
+					 data->pa_hdl);
+				data->pa_iova = (unsigned long)-1;
+				clear_bit(MMU_PAGEFAULT, &data->state);
+			}
 			reg_from_run_to_done(data, pservice->reg_codec);
-			/* avoid vpu timeout and can't recover problem */
-			if (data->mode == VCODEC_RUNNING_MODE_VPU)
-				VDPU_SOFT_RESET(data->regs);
+			if (pservice->soft_reset)
+				vpu_soft_reset(data);
 		}
 	}
 
 	if (atomic_read(&dev->irq_count_pp)) {
 		atomic_sub(1, &dev->irq_count_pp);
-		if (pservice->reg_pproc == NULL)
+		if (!pservice->reg_pproc)
 			vpu_err("error: pp isr with no task waiting\n");
 		else
 			reg_from_run_to_done(data, pservice->reg_pproc);
@@ -2937,7 +3929,7 @@ static irqreturn_t vepu_isr(int irq, void *dev_id)
 	mutex_lock(&pservice->lock);
 	if (atomic_read(&dev->irq_count_codec)) {
 		atomic_sub(1, &dev->irq_count_codec);
-		if (NULL == pservice->reg_codec)
+		if (!pservice->reg_codec)
 			vpu_err("error: enc isr with no task waiting\n");
 		else
 			reg_from_run_to_done(data, pservice->reg_codec);

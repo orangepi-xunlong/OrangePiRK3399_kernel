@@ -64,6 +64,22 @@ struct inno_hdmi_i2c {
 	struct completion cmp;
 };
 
+enum inno_hdmi_dev_type {
+	RK3036_HDMI,
+	RK3128_HDMI,
+};
+
+struct inno_hdmi_phy_config {
+	unsigned long mpixelclock;
+	u8 pre_emphasis;	/* pre-emphasis value */
+	u8 vlev_ctr;		/* voltage level control */
+};
+
+struct inno_hdmi_plat_data {
+	enum inno_hdmi_dev_type dev_type;
+	struct inno_hdmi_phy_config *phy_config;
+};
+
 struct inno_hdmi {
 	struct device *dev;
 	struct drm_device *drm_dev;
@@ -81,6 +97,7 @@ struct inno_hdmi {
 	struct i2c_adapter *ddc;
 
 	unsigned int tmds_rate;
+	const struct inno_hdmi_plat_data *plat_data;
 
 	struct platform_device *audio_pdev;
 	bool audio_enable;
@@ -211,17 +228,20 @@ static void inno_hdmi_sys_power(struct inno_hdmi *hdmi, bool enable)
 
 static void inno_hdmi_set_pwr_mode(struct inno_hdmi *hdmi, int mode)
 {
-	u8 value;
+	const struct inno_hdmi_phy_config *phy_config =
+						hdmi->plat_data->phy_config;
 
 	switch (mode) {
 	case NORMAL:
 		inno_hdmi_sys_power(hdmi, false);
-		if (hdmi->tmds_rate > 140000000)
-			value = 0x6f;
-		else
-			value = 0x3f;
-		hdmi_writeb(hdmi, HDMI_PHY_PRE_EMPHASIS, value);
-		hdmi_writeb(hdmi, HDMI_PHY_DRIVER, 0xbb);
+		for (; phy_config->mpixelclock != ~0UL; phy_config++)
+			if (hdmi->tmds_rate <= phy_config->mpixelclock)
+				break;
+		if (!phy_config->mpixelclock)
+			return;
+		hdmi_writeb(hdmi, HDMI_PHY_PRE_EMPHASIS,
+			    phy_config->pre_emphasis);
+		hdmi_writeb(hdmi, HDMI_PHY_DRIVER, phy_config->vlev_ctr);
 
 		hdmi_writeb(hdmi, HDMI_PHY_SYS_CTL, 0x15);
 		hdmi_writeb(hdmi, HDMI_PHY_SYS_CTL, 0x14);
@@ -427,11 +447,12 @@ static int inno_hdmi_config_video_timing(struct inno_hdmi *hdmi,
 {
 	int value;
 
-	value = BIT(20) | BIT(21);
-	value |= mode->flags & DRM_MODE_FLAG_PHSYNC ? BIT(4) : 0;
-	value |= mode->flags & DRM_MODE_FLAG_PVSYNC ? BIT(5) : 0;
-	regmap_write(hdmi->regmap, 0x148, value);
-
+	if (hdmi->plat_data->dev_type == RK3036_HDMI) {
+		value = BIT(20) | BIT(21);
+		value |= mode->flags & DRM_MODE_FLAG_PHSYNC ? BIT(4) : 0;
+		value |= mode->flags & DRM_MODE_FLAG_PVSYNC ? BIT(5) : 0;
+		regmap_write(hdmi->regmap, 0x148, value);
+	}
 	/* Set detail external video timing polarity and interlace mode */
 	value = v_EXTERANL_VIDEO(1);
 	value |= mode->flags & DRM_MODE_FLAG_PHSYNC ?
@@ -600,8 +621,12 @@ inno_hdmi_connector_detect(struct drm_connector *connector, bool force)
 static int inno_hdmi_connector_get_modes(struct drm_connector *connector)
 {
 	struct inno_hdmi *hdmi = to_inno_hdmi(connector);
+	struct drm_display_mode *mode;
+	struct drm_display_info *info = &connector->display_info;
+	const u8 def_modes[6] = {4, 16, 31, 19, 17, 2};
 	struct edid *edid;
 	int ret = 0;
+	u8 i;
 
 	if (!hdmi->ddc)
 		return 0;
@@ -613,6 +638,25 @@ static int inno_hdmi_connector_get_modes(struct drm_connector *connector)
 		drm_mode_connector_update_edid_property(connector, edid);
 		ret = drm_add_edid_modes(connector, edid);
 		kfree(edid);
+	} else {
+		hdmi->hdmi_data.sink_is_hdmi = true;
+		hdmi->hdmi_data.sink_has_audio = true;
+		for (i = 0; i < sizeof(def_modes); i++) {
+			mode = drm_display_mode_from_vic_index(connector,
+							       def_modes,
+							       31, i);
+			if (mode) {
+				if (!i)
+					mode->type = DRM_MODE_TYPE_PREFERRED;
+				drm_mode_probed_add(connector, mode);
+				ret++;
+			}
+		}
+		info->edid_hdmi_dc_modes = 0;
+		info->hdmi.y420_dc_modes = 0;
+		info->color_formats = 0;
+
+		dev_info(hdmi->dev, "failed to get edid\n");
 	}
 
 	return ret;
@@ -662,7 +706,8 @@ static struct drm_connector_helper_funcs inno_hdmi_connector_helper_funcs = {
 	.best_encoder = inno_hdmi_connector_best_encoder,
 };
 
-int inno_hdmi_audio_config_set(struct inno_hdmi *hdmi, struct audio_info *audio)
+static int
+inno_hdmi_audio_config_set(struct inno_hdmi *hdmi, struct audio_info *audio)
 {
 	int rate, N, channel;
 
@@ -1039,11 +1084,47 @@ static struct i2c_adapter *inno_hdmi_i2c_adapter(struct inno_hdmi *hdmi)
 	return adap;
 }
 
+static struct inno_hdmi_phy_config rk3036_hdmi_phy_config[] = {
+	/* pixelclk pre-emp vlev */
+	{ 74250000,  0x3f, 0xbb },
+	{ 165000000, 0x6f, 0xbb },
+	{ ~0UL,	     0x00, 0x00 }
+};
+
+static struct inno_hdmi_phy_config rk3128_hdmi_phy_config[] = {
+	/* pixelclk pre-emp vlev */
+	{ 74250000,  0x3f, 0xaa },
+	{ 165000000, 0x5f, 0xaa },
+	{ ~0UL,	     0x00, 0x00 }
+};
+
+static const struct inno_hdmi_plat_data rk3036_hdmi_drv_data = {
+	.dev_type   = RK3036_HDMI,
+	.phy_config = rk3036_hdmi_phy_config,
+};
+
+static const struct inno_hdmi_plat_data rk3128_hdmi_drv_data = {
+	.dev_type   = RK3128_HDMI,
+	.phy_config = rk3128_hdmi_phy_config,
+};
+
+static const struct of_device_id inno_hdmi_dt_ids[] = {
+	{ .compatible = "rockchip,rk3036-inno-hdmi",
+	  .data = &rk3036_hdmi_drv_data,
+	},
+	{ .compatible = "rockchip,rk3128-inno-hdmi",
+	  .data = &rk3128_hdmi_drv_data,
+	},
+	{},
+};
+MODULE_DEVICE_TABLE(of, inno_hdmi_dt_ids);
+
 static int inno_hdmi_bind(struct device *dev, struct device *master,
 				 void *data)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct drm_device *drm = data;
+	const struct of_device_id *match;
 	struct inno_hdmi *hdmi;
 	struct resource *iores;
 	int irq;
@@ -1055,6 +1136,9 @@ static int inno_hdmi_bind(struct device *dev, struct device *master,
 
 	hdmi->dev = dev;
 	hdmi->drm_dev = drm;
+
+	match = of_match_node(inno_hdmi_dt_ids, pdev->dev.of_node);
+	hdmi->plat_data = match->data;
 
 	iores = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!iores)
@@ -1176,13 +1260,6 @@ static int inno_hdmi_remove(struct platform_device *pdev)
 
 	return 0;
 }
-
-static const struct of_device_id inno_hdmi_dt_ids[] = {
-	{ .compatible = "rockchip,rk3036-inno-hdmi",
-	},
-	{},
-};
-MODULE_DEVICE_TABLE(of, inno_hdmi_dt_ids);
 
 static struct platform_driver inno_hdmi_driver = {
 	.probe  = inno_hdmi_probe,

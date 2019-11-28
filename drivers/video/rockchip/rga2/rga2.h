@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _RGA_DRIVER_H_
 #define _RGA_DRIVER_H_
 
@@ -11,6 +12,7 @@
 #define RGA_FLUSH       0x5019
 #define RGA_GET_RESULT  0x501a
 #define RGA_GET_VERSION 0x501b
+#define RGA_CACHE_FLUSH 0x501c
 
 #define RGA2_BLIT_SYNC	 0x6017
 #define RGA2_BLIT_ASYNC  0x6018
@@ -100,6 +102,16 @@ enum
     RGA2_FORMAT_YCrCb_422_P  = 0x15,
     RGA2_FORMAT_YCrCb_420_SP = 0x16,
     RGA2_FORMAT_YCrCb_420_P  = 0x17,
+
+	RGA2_FORMAT_YVYU_422 = 0x18,
+	RGA2_FORMAT_YVYU_420 = 0x19,
+	RGA2_FORMAT_VYUY_422 = 0x1a,
+	RGA2_FORMAT_VYUY_420 = 0x1b,
+	RGA2_FORMAT_YUYV_422 = 0x1c,
+	RGA2_FORMAT_YUYV_420 = 0x1d,
+	RGA2_FORMAT_UYVY_422 = 0x1e,
+	RGA2_FORMAT_UYVY_420 = 0x1f,
+
     RGA2_FORMAT_YCbCr_420_SP_10B = 0x20,
     RGA2_FORMAT_YCrCb_420_SP_10B = 0x21,
     RGA2_FORMAT_YCbCr_422_SP_10B = 0x22,
@@ -701,9 +713,7 @@ struct rga2_service_info {
 };
 
 #define RGA2_TEST_CASE 0
-#define RGA2_TEST      0
-#define RGA2_TEST_MSG  0
-#define RGA2_TEST_TIME 0
+#define RGA2_DEBUGFS 1
 
 //General Registers
 #define RGA2_SYS_CTRL             0x000

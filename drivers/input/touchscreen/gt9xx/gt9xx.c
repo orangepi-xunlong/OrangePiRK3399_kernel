@@ -2633,8 +2633,8 @@ static int goodix_ts_probe(struct i2c_client *client, const struct i2c_device_id
 		gtp_y_reverse = TRUE;
 	} else if (val == 101) {
 		m89or101 = FALSE;
-		gtp_change_x2y = FALSE;
-		gtp_x_reverse = FALSE;
+		gtp_change_x2y = TRUE;
+		gtp_x_reverse = TRUE;
 		gtp_y_reverse = FALSE;
 	} else if (val == 911) {
 		m89or101 = FALSE;
@@ -3183,8 +3183,8 @@ static void goodix_ts_exit(void)
         destroy_workqueue(goodix_wq);
     }
 }
-late_initcall(goodix_ts_init);
-//module_init(goodix_ts_init);
+//late_initcall(goodix_ts_init);
+module_init(goodix_ts_init);
 
 module_exit(goodix_ts_exit);
 

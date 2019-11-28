@@ -21,7 +21,6 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/reset.h>
-#include <linux/rockchip/pmu.h>
 
 #include "vpu_iommu_ops.h"
 #include "mpp_service.h"
@@ -636,7 +635,7 @@ static struct mpp_session *mpp_dev_rkvenc_open(struct rockchip_mpp_dev *mpp)
 	return &session->isession;
 }
 
-static void mpp_dev_rkvenc_release(struct mpp_session *isession)
+static void mpp_dev_rkvenc_free(struct mpp_session *isession)
 {
 	struct rkvenc_session *session = to_rkvenc_session(isession);
 
@@ -652,7 +651,7 @@ struct mpp_dev_ops rkvenc_ops = {
 	.result = rockchip_mpp_rkvenc_result,
 	.ioctl = rockchip_mpp_rkvenc_ioctl,
 	.open = mpp_dev_rkvenc_open,
-	.release = mpp_dev_rkvenc_release,
+	.free = mpp_dev_rkvenc_free,
 };
 
 static void rockchip_mpp_rkvenc_power_on(struct rockchip_mpp_dev *mpp)

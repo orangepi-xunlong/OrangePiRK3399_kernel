@@ -30,6 +30,13 @@
 #define AFBDC_FMT_U8U8U8U8	0x5
 #define AFBDC_FMT_U8U8U8	0x4
 
+enum bcsh_out_mode {
+	BCSH_OUT_MODE_BLACK,
+	BCSH_OUT_MODE_BLUE,
+	BCSH_OUT_MODE_COLOR_BAR,
+	BCSH_OUT_MODE_NORMAL_VIDEO,
+};
+
 enum cabc_stage_mode {
 	LAST_FRAME_PWM_VAL	= 0x0,
 	CUR_FRAME_PWM_VAL	= 0x1,
@@ -67,6 +74,13 @@ enum vop_data_format {
 	VOP_FMT_YUV444SP,
 };
 
+enum vop_raw_format {
+	VOP_RAW8	= 0,
+	VOP_RAW10,
+	VOP_RAW_RESERVED,
+	VOP_RAW16,
+};
+
 struct vop_reg_data {
 	uint32_t offset;
 	uint32_t value;
@@ -86,6 +100,7 @@ struct vop_csc {
 	struct vop_reg y2r_en;
 	struct vop_reg r2r_en;
 	struct vop_reg r2y_en;
+	struct vop_reg csc_mode;
 
 	uint32_t y2r_offset;
 	uint32_t r2r_offset;
@@ -95,6 +110,7 @@ struct vop_csc {
 struct vop_ctrl {
 	struct vop_reg version;
 	struct vop_reg standby;
+	struct vop_reg dma_stop;
 	struct vop_reg axi_outstanding_max_num;
 	struct vop_reg axi_max_outstanding_en;
 	struct vop_reg htotal_pw;
@@ -140,8 +156,11 @@ struct vop_ctrl {
 	struct vop_reg mipi_pin_pol;
 	struct vop_reg dp_dclk_pol;
 	struct vop_reg dp_pin_pol;
-	struct vop_reg dither_up;
-	struct vop_reg dither_down;
+	struct vop_reg dither_down_sel;
+	struct vop_reg dither_down_mode;
+	struct vop_reg dither_down_en;
+	struct vop_reg pre_dither_down_en;
+	struct vop_reg dither_up_en;
 
 	struct vop_reg sw_dac_sel;
 	struct vop_reg tve_sw_mode;
@@ -173,6 +192,9 @@ struct vop_ctrl {
 	struct vop_reg afbdc_pic_size;
 	struct vop_reg afbdc_hdr_ptr;
 	struct vop_reg afbdc_rstn;
+	struct vop_reg afbdc_pic_vir_width;
+	struct vop_reg afbdc_pic_offset;
+	struct vop_reg afbdc_axi_ctrl;
 
 	/* CABC */
 	struct vop_reg cabc_total_num;
@@ -207,6 +229,7 @@ struct vop_ctrl {
 	struct vop_reg level2_overlay_en;
 	struct vop_reg alpha_hard_calc;
 	struct vop_reg hdr2sdr_en;
+	struct vop_reg hdr2sdr_en_win0_csc;
 	struct vop_reg hdr2sdr_src_min;
 	struct vop_reg hdr2sdr_src_max;
 	struct vop_reg hdr2sdr_normfaceetf;
@@ -224,6 +247,28 @@ struct vop_ctrl {
 	struct vop_reg st2084oetf_post_conv_en;
 	struct vop_reg win_csc_mode_sel;
 
+	/* MCU OUTPUT */
+	struct vop_reg mcu_pix_total;
+	struct vop_reg mcu_cs_pst;
+	struct vop_reg mcu_cs_pend;
+	struct vop_reg mcu_rw_pst;
+	struct vop_reg mcu_rw_pend;
+	struct vop_reg mcu_clk_sel;
+	struct vop_reg mcu_hold_mode;
+	struct vop_reg mcu_frame_st;
+	struct vop_reg mcu_rs;
+	struct vop_reg mcu_bypass;
+	struct vop_reg mcu_type;
+	struct vop_reg mcu_rw_bypass_port;
+
+	/* VOP RAW */
+	struct vop_reg frame_st;
+	struct vop_reg work_mode; /* bypass, pingpong, hold mode */
+	struct vop_reg pdaf_en;
+	struct vop_reg pdaf_type; /* hblank or vblank mode */
+	struct vop_reg pdaf_vc_num;
+
+	struct vop_reg reg_done_frm;
 	struct vop_reg cfg_done;
 };
 
@@ -349,6 +394,12 @@ enum _vop_rgb2rgb_conv_mode {
 	BT2020_TO_BT709,
 };
 
+enum _MCU_IOCTL {
+	MCU_WRCMD = 0,
+	MCU_WRDATA,
+	MCU_SETBYPASS,
+};
+
 struct vop_win_phy {
 	const struct vop_scl_regs *scl;
 	const uint32_t *data_formats;
@@ -375,8 +426,14 @@ struct vop_win_phy {
 	struct vop_reg src_alpha_ctl;
 	struct vop_reg alpha_mode;
 	struct vop_reg alpha_en;
+	struct vop_reg alpha_pre_mul;
+	struct vop_reg global_alpha_val;
 	struct vop_reg key_color;
 	struct vop_reg key_en;
+	struct vop_reg yrgb_mst1;
+	struct vop_reg ex_wc;
+	struct vop_reg data_type;
+	struct vop_reg vact_st_end_info;
 };
 
 struct vop_win_data {
@@ -389,12 +446,19 @@ struct vop_win_data {
 	u64 feature;
 };
 
+struct vop_grf_ctrl {
+	struct vop_reg grf_dclk_inv;
+};
+
 #define VOP_FEATURE_OUTPUT_10BIT	BIT(0)
 #define VOP_FEATURE_AFBDC		BIT(1)
+#define VOP_FEATURE_ALPHA_SCALE		BIT(2)
 
 #define WIN_FEATURE_HDR2SDR		BIT(0)
 #define WIN_FEATURE_SDR2HDR		BIT(1)
 #define WIN_FEATURE_PRE_OVERLAY		BIT(2)
+#define WIN_FEATURE_AFBDC		BIT(3)
+#define WIN_FEATURE_PDAF_AFTER_VBLANK	BIT(4)
 
 struct vop_rect {
 	int width;
@@ -409,6 +473,7 @@ struct vop_data {
 	const struct vop_win_data *win;
 	const struct vop_csc_table *csc_table;
 	const struct vop_hdr_table *hdr_table;
+	const struct vop_grf_ctrl *grf_ctrl;
 	unsigned int win_size;
 	uint32_t version;
 	struct vop_rect max_input;
@@ -419,42 +484,33 @@ struct vop_data {
 #define CVBS_PAL_VDISPLAY		288
 
 /* interrupt define */
-#define DSP_HOLD_VALID_INTR		(1 << 0)
-#define FS_INTR				(1 << 1)
-#define LINE_FLAG_INTR			(1 << 2)
-#define BUS_ERROR_INTR			(1 << 3)
-#define FS_NEW_INTR			(1 << 4)
-#define ADDR_SAME_INTR 			(1 << 5)
-#define LINE_FLAG1_INTR			(1 << 6)
-#define WIN0_EMPTY_INTR			(1 << 7)
-#define WIN1_EMPTY_INTR			(1 << 8)
-#define WIN2_EMPTY_INTR			(1 << 9)
-#define WIN3_EMPTY_INTR			(1 << 10)
-#define HWC_EMPTY_INTR			(1 << 11)
-#define POST_BUF_EMPTY_INTR		(1 << 12)
-#define PWM_GEN_INTR			(1 << 13)
+#define DSP_HOLD_VALID_INTR		BIT(0)
+#define FS_INTR				BIT(1)
+#define LINE_FLAG_INTR			BIT(2)
+#define BUS_ERROR_INTR			BIT(3)
+#define FS_NEW_INTR			BIT(4)
+#define ADDR_SAME_INTR			BIT(5)
+#define LINE_FLAG1_INTR			BIT(6)
+#define WIN0_EMPTY_INTR			BIT(7)
+#define WIN1_EMPTY_INTR			BIT(8)
+#define WIN2_EMPTY_INTR			BIT(9)
+#define WIN3_EMPTY_INTR			BIT(10)
+#define HWC_EMPTY_INTR			BIT(11)
+#define POST_BUF_EMPTY_INTR		BIT(12)
+#define PWM_GEN_INTR			BIT(13)
+#define DMA_FINISH_INTR			BIT(14)
+#define FS_FIELD_INTR			BIT(15)
+#define FE_INTR				BIT(16)
 
 #define INTR_MASK			(DSP_HOLD_VALID_INTR | FS_INTR | \
 					 LINE_FLAG_INTR | BUS_ERROR_INTR | \
 					 FS_NEW_INTR | LINE_FLAG1_INTR | \
 					 WIN0_EMPTY_INTR | WIN1_EMPTY_INTR | \
 					 WIN2_EMPTY_INTR | WIN3_EMPTY_INTR | \
-					 HWC_EMPTY_INTR | POST_BUF_EMPTY_INTR)
-
-#define DSP_HOLD_VALID_INTR_EN(x)	((x) << 4)
-#define FS_INTR_EN(x)			((x) << 5)
-#define LINE_FLAG_INTR_EN(x)		((x) << 6)
-#define BUS_ERROR_INTR_EN(x)		((x) << 7)
-#define DSP_HOLD_VALID_INTR_MASK	(1 << 4)
-#define FS_INTR_MASK			(1 << 5)
-#define LINE_FLAG_INTR_MASK		(1 << 6)
-#define BUS_ERROR_INTR_MASK		(1 << 7)
-
-#define INTR_CLR_SHIFT			8
-#define DSP_HOLD_VALID_INTR_CLR		(1 << (INTR_CLR_SHIFT + 0))
-#define FS_INTR_CLR			(1 << (INTR_CLR_SHIFT + 1))
-#define LINE_FLAG_INTR_CLR		(1 << (INTR_CLR_SHIFT + 2))
-#define BUS_ERROR_INTR_CLR		(1 << (INTR_CLR_SHIFT + 3))
+					 HWC_EMPTY_INTR | \
+					 POST_BUF_EMPTY_INTR | \
+					 DMA_FINISH_INTR | FS_FIELD_INTR | \
+					 FE_INTR)
 
 #define DSP_LINE_NUM(x)			(((x) & 0x1fff) << 12)
 #define DSP_LINE_NUM_MASK		(0x1fff << 12)
@@ -553,15 +609,28 @@ enum dither_down_mode_sel {
 	DITHER_DOWN_FRC = 0x1
 };
 
-#define PRE_DITHER_DOWN_EN(x)	((x) << 0)
-#define DITHER_DOWN_EN(x)	((x) << 1)
-#define DITHER_DOWN_MODE(x)	((x) << 2)
-#define DITHER_DOWN_MODE_SEL(x)	((x) << 3)
-
 enum vop_pol {
 	HSYNC_POSITIVE = 0,
 	VSYNC_POSITIVE = 1,
 	DEN_NEGATIVE   = 2,
+};
+
+enum vop_pdaf_mode {
+	VOP_HOLD_MODE = 0,
+	VOP_NORMAL_MODE,
+	VOP_PINGPONG_MODE,
+	VOP_BYPASS_MODE,
+	VOP_BACKGROUND_MODE,
+	VOP_ONEFRAME_MODE,
+	VOP_ONEFRAME_NOSEND_MODE
+};
+
+enum vop_pdaf_type {
+	VOP_PDAF_TYPE_DEFAULT = 0,
+	VOP_PDAF_TYPE_HBLANK,
+	VOP_PDAF_TYPE_VBLANK,
+	VOP_PDAF_TYPE_HBLANK_VBLANK,
+	VOP_PDAF_TYPE_INTERWEAVE,
 };
 
 #define FRAC_16_16(mult, div)    (((mult) << 16) / (div))
@@ -621,9 +690,9 @@ static inline int scl_vop_cal_lb_mode(int width, bool is_yuv)
 {
 	int lb_mode;
 
-	if (width > 2560)
+	if (!is_yuv && (width > 2560))
 		lb_mode = LB_RGB_3840X2;
-	else if (width > 1920)
+	else if (!is_yuv && (width > 1920))
 		lb_mode = LB_RGB_2560X4;
 	else if (!is_yuv)
 		lb_mode = LB_RGB_1920X5;
@@ -646,4 +715,10 @@ static inline int interpolate(int x1, int y1, int x2, int y2, int x)
 }
 
 extern const struct component_ops vop_component_ops;
+
+#if defined(CONFIG_ROCKCHIP_DRM_DEBUG)
+int drm_debugfs_vop_add(struct drm_crtc *crtc, struct dentry *root);
+int vop_plane_dump(struct vop_dump_info *dump_info, int frame_count);
+#endif
+
 #endif /* _ROCKCHIP_DRM_VOP_H */

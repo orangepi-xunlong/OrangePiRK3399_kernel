@@ -19,6 +19,9 @@
 #include <linux/slab.h>
 #include <linux/thermal.h>
 
+#ifdef CONFIG_ARCH_ROCKCHIP
+#include <soc/rockchip/rockchip_system_monitor.h>
+#endif
 #define CREATE_TRACE_POINTS
 #include <trace/events/thermal_power_allocator.h>
 
@@ -155,15 +158,15 @@ static void estimate_pid_constants(struct thermal_zone_device *tz,
 	if (!temperature_threshold)
 		return;
 
-	if (!tz->tzp->k_po || force)
+	if (!tz->tzp->is_k_po_available || force)
 		tz->tzp->k_po = int_to_frac(sustainable_power) /
 			temperature_threshold;
 
-	if (!tz->tzp->k_pu || force)
+	if (!tz->tzp->is_k_pu_available || force)
 		tz->tzp->k_pu = int_to_frac(2 * sustainable_power) /
 			temperature_threshold;
 
-	if (!tz->tzp->k_i || force)
+	if (!tz->tzp->is_k_i_available || force)
 		tz->tzp->k_i = int_to_frac(10) / 1000;
 	/*
 	 * The default for k_d and integral_cutoff is 0, so we can
@@ -523,15 +526,22 @@ static void allow_maximum_power(struct thermal_zone_device *tz)
 	struct thermal_instance *instance;
 	struct power_allocator_params *params = tz->governor_data;
 
+	mutex_lock(&tz->lock);
 	list_for_each_entry(instance, &tz->thermal_instances, tz_node) {
 		if ((instance->trip != params->trip_max_desired_temperature) ||
 		    (!cdev_is_power_actor(instance->cdev)))
 			continue;
 
 		instance->target = 0;
+#ifdef CONFIG_ARCH_ROCKCHIP
+		rockchip_system_monitor_adjust_cdev_state(instance->cdev,
+							  tz->temperature,
+							  &instance->target);
+#endif
 		instance->cdev->updated = false;
 		thermal_cdev_update(instance->cdev);
 	}
+	mutex_unlock(&tz->lock);
 }
 
 /**

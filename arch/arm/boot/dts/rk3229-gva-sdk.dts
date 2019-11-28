@@ -139,6 +139,44 @@
 		};
 	};
 
+	vcc_otg_vbus: otg-vbus-regulator {
+		compatible = "regulator-fixed";
+		gpio = <&gpio3 RK_PC6 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&otg_vbus_drv>;
+		regulator-name = "vcc_otg_vbus";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		enable-active-high;
+	};
+
+	xin32k: xin32k {
+		compatible = "fixed-clock";
+		clock-frequency = <32768>;
+		clock-output-names = "xin32k";
+		#clock-cells = <0>;
+	};
+};
+
+&firmware_android {
+	compatible = "android,firmware";
+	fstab {
+		compatible = "android,fstab";
+		system {
+			compatible = "android,system";
+			dev = "/dev/block/by-name/system";
+			type = "ext4";
+			mnt_flags = "ro,barrier=1,inode_readahead_blks=8";
+			fsmgr_flags = "wait,verify";
+		};
+		vendor {
+			compatible = "android,vendor";
+			dev = "/dev/block/by-name/vendor";
+			type = "ext4";
+			mnt_flags = "ro,barrier=1,inode_readahead_blks=8";
+			fsmgr_flags = "wait,verify";
+		};
+	};
 };
 
 &gpu {
@@ -175,7 +213,7 @@
 		gpio-controller;
 		#gpio-cells = <2>;
 		#clock-cells = <1>;
-		clock-output-names = "xin32k", "rk805-clkout2";
+		clock-output-names = "rk805-clkout1", "rk805-clkout2";
 
 		rtc {
 			status = "okay";
@@ -373,6 +411,11 @@
 		};
 	};
 
+	usb {
+		otg_vbus_drv: otg-vbus-drv {
+			rockchip,pins = <3 RK_PC6 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
 };
 
 &sdio {
@@ -391,4 +434,8 @@
 		|RKPM_CTR_PMIC
 		)
 	>;
+};
+
+&u2phy0_otg {
+	vbus-supply = <&vcc_otg_vbus>;
 };

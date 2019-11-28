@@ -1,1 +1,2 @@
-obj-y += mali/ ump/
+# SPDX-License-Identifier: GPL-2.0
+obj-y += mali/

@@ -56,7 +56,7 @@
 	};
 
 	sdio_pwrseq: sdio-pwrseq {
-		clocks = <&rk808>;
+		clocks = <&rk808 1>;
 	};
 
 	wireless-bluetooth {
@@ -169,7 +169,7 @@
 
 	fiq-debugger {
 		compatible = "rockchip,fiq-debugger";
-		interrupts = <GIC_SPI 153 IRQ_TYPE_LEVEL_HIGH 0>;
+		interrupts = <GIC_SPI 153 IRQ_TYPE_LEVEL_HIGH>;
 		rockchip,serial-id = <2>;
 		rockchip,wake-irq = <0>;
 		/* If enable uart uses irq instead of fiq */
@@ -177,6 +177,13 @@
 		rockchip,baudrate = <115200>;  /* Only 115200 and 1500000 */
 		pinctrl-names = "default";
 		pinctrl-0 = <&uart2_xfer>;
+	};
+
+	xin32k: xin32k {
+		compatible = "fixed-clock";
+		clock-frequency = <32768>;
+		clock-output-names = "xin32k";
+		#clock-cells = <0>;
 	};
 
 	vccadc_ref: vccadc-ref {
@@ -210,7 +217,7 @@
 	 */
 
 	wireless-bluetooth {
-		clocks = <&hym8563 1>;
+		clocks = <&hym8563>;
 		clock-names = "ext_clock";
 	};
 
@@ -355,6 +362,7 @@
 &edp_panel {
 	compatible ="lg,lp079qx1-sp0v", "simple-panel";
 	bus-format = <MEDIA_BUS_FMT_RGB666_1X18>;
+	bpc = <6>;
 	backlight = <&backlight>;
 	enable-gpios = <&gpio5 19 GPIO_ACTIVE_HIGH>;
 	reset-gpios = <&gpio5 17 GPIO_ACTIVE_LOW>;
@@ -405,7 +413,7 @@
 		rockchip,system-power-controller;
 		wakeup-source;
 		#clock-cells = <1>;
-		clock-output-names = "xin32k", "rk808-clkout2";
+		clock-output-names = "rk808-clkout1", "rk808-clkout2";
 		vcc1-supply = <&vcc_sys>;
 		vcc2-supply = <&vcc_sys>;
 		vcc3-supply = <&vcc_sys>;
@@ -730,7 +738,7 @@
 
 &pwm0 {
 	status = "okay";
-	interrupts = <GIC_SPI 78 IRQ_TYPE_LEVEL_HIGH 0>;
+	interrupts = <GIC_SPI 78 IRQ_TYPE_LEVEL_HIGH>;
 	compatible = "rockchip,remotectl-pwm";
 	remote_pwm_id = <0>;
 	handle_cpu_id = <0>;
@@ -754,9 +762,7 @@
 };
 
 &tsadc {
-	rockchip,hw-tshut-mode = <0>; /* tshut mode 0:CRU 1:GPIO */
 	rockchip,hw-tshut-polarity = <1>; /* tshut polarity 0:LOW 1:HIGH */
-	pinctrl-1 = <&otp_gpio>;
 };
 
 &pinctrl {

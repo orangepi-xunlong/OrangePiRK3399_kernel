@@ -228,20 +228,12 @@ __ATTR(_name, _perm, show_##_name, NULL)
 static struct freq_attr _name =			\
 __ATTR(_name, 0644, show_##_name, store_##_name)
 
-struct global_attr {
-	struct attribute attr;
-	ssize_t (*show)(struct kobject *kobj,
-			struct attribute *attr, char *buf);
-	ssize_t (*store)(struct kobject *a, struct attribute *b,
-			 const char *c, size_t count);
-};
-
 #define define_one_global_ro(_name)		\
-static struct global_attr _name =		\
+static struct kobj_attribute _name =		\
 __ATTR(_name, 0444, show_##_name, NULL)
 
 #define define_one_global_rw(_name)		\
-static struct global_attr _name =		\
+static struct kobj_attribute _name =		\
 __ATTR(_name, 0644, show_##_name, store_##_name)
 
 
@@ -697,11 +689,31 @@ unsigned long cpufreq_scale_freq_capacity(struct sched_domain *sd, int cpu);
 unsigned long cpufreq_scale_max_freq_capacity(int cpu);
 #ifdef CONFIG_ARM_ROCKCHIP_CPUFREQ
 unsigned int rockchip_cpufreq_adjust_target(int cpu, unsigned int freq);
+int rockchip_cpufreq_get_scale(int cpu);
+int rockchip_cpufreq_set_scale_rate(struct device *dev, unsigned long rate);
+int rockchip_cpufreq_check_rate_volt(struct device *dev);
 #else
 static inline unsigned int rockchip_cpufreq_adjust_target(int cpu,
 							  unsigned int freq)
 {
 	return freq;
 }
+
+static inline int rockchip_cpufreq_get_scale(int cpu)
+{
+	return -EINVAL;
+}
+
+static inline int rockchip_cpufreq_set_scale_rate(struct device *dev,
+						  unsigned long rate)
+{
+	return -EINVAL;
+}
+
+static inline int rockchip_cpufreq_check_rate_volt(struct device *dev)
+{
+	return -EINVAL;
+}
+
 #endif
 #endif /* _LINUX_CPUFREQ_H */

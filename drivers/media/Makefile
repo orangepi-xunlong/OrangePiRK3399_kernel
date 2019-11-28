@@ -2,14 +2,6 @@
 # Makefile for the kernel multimedia device drivers.
 #
 
-ifeq ($(CONFIG_MEDIA_CEC_EDID),y)
-  obj-$(CONFIG_MEDIA_SUPPORT) += cec-edid.o
-endif
-
-ifeq ($(CONFIG_MEDIA_CEC_SUPPORT),y)
-  obj-$(CONFIG_MEDIA_SUPPORT) += cec/
-endif
-
 media-objs	:= media-device.o media-devnode.o media-entity.o
 
 #
@@ -32,11 +24,13 @@ obj-$(CONFIG_DVB_CORE)  += dvb-core/
 # There are both core and drivers at RC subtree - merge before drivers
 obj-y += rc/
 
+obj-$(CONFIG_CEC_CORE) += cec/
+
 #
 # Finally, merge the drivers that require the core
 #
 
-obj-y += common/ platform/ pci/ usb/ mmc/ firewire/
+obj-y += common/ platform/ pci/ usb/ mmc/ firewire/ spi/
 obj-$(CONFIG_VIDEO_DEV) += radio/
 obj-$(CONFIG_CAMSYS_DRV) += video/rk_camsys/
 obj-$(CONFIG_ROCK_CHIP_SOC_CAMERA) += video/

@@ -146,7 +146,7 @@ static int dw_mci_rk3288_execute_tuning(struct dw_mci_slot *slot, u32 opcode)
 	}
 
 	if (range_count == 0) {
-		dev_warn(host->dev, "All phases bad!");
+		dev_warn_ratelimited(host->dev, "All phases bad!");
 		ret = -EIO;
 		goto free;
 	}
@@ -235,6 +235,10 @@ static int dw_mci_rockchip_init(struct dw_mci *host)
 
 	/* It needs this quirk on all Rockchip SoCs */
 	host->pdata->quirks |= DW_MCI_QUIRK_BROKEN_DTO;
+
+	if (of_device_is_compatible(host->dev->of_node,
+				    "rockchip,rk3308-dw-mshc"))
+		host->pdata->quirks |= DW_MCI_QUIRK_BROKEN_XFER;
 
 	return 0;
 }

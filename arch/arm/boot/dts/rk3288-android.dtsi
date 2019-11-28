@@ -46,6 +46,10 @@
 #include <dt-bindings/display/media-bus-format.h>
 
 / {
+	firmware {
+		firmware_android: android {};
+	};
+
 	chosen {
 		bootargs = "earlycon=uart8250,mmio32,0xff690000 vmalloc=496M";
 	};
@@ -85,7 +89,7 @@
 			SYS_STATUS_REBOOT	396000
 			SYS_STATUS_SUSPEND	192000
 			SYS_STATUS_VIDEO_1080P	300000
-			SYS_STATUS_VIDEO_4K	396000
+			SYS_STATUS_VIDEO_4K	528000
 			SYS_STATUS_VIDEO_4K_10B	528000
 			SYS_STATUS_PERFORMANCE	528000
 			SYS_STATUS_BOOST	396000
@@ -140,7 +144,7 @@
 
 	fiq-debugger {
 		compatible = "rockchip,fiq-debugger";
-		interrupts = <GIC_SPI 155 IRQ_TYPE_LEVEL_HIGH 0>;
+		interrupts = <GIC_SPI 155 IRQ_TYPE_LEVEL_HIGH>;
 		rockchip,serial-id = <2>;
 		rockchip,wake-irq = <0>;
 		rockchip,irq-mode-enable = <0>;  /* If enable uart uses irq instead of fiq */
@@ -230,6 +234,24 @@
 				logo,mode = "center";
 				charge_logo,mode = "center";
 				connect = <&vopl_out_lvds>;
+			};
+
+			route_hdmi: route-hdmi {
+				status = "disabled";
+				logo,uboot = "logo.bmp";
+				logo,kernel = "logo_kernel.bmp";
+				logo,mode = "center";
+				charge_logo,mode = "center";
+				connect = <&vopb_out_hdmi>;
+			};
+
+			route_rgb: route-rgb {
+				status = "disabled";
+				logo,uboot = "logo.bmp";
+				logo,kernel = "logo_kernel.bmp";
+				logo,mode = "center";
+				charge_logo,mode = "center";
+				connect = <&vopl_out_rgb>;
 			};
 		};
 	};
@@ -357,24 +379,8 @@
 	};
 };
 
-&edp_panel {
-	backlight = <&backlight>;
-};
-
 &cpu0 {
 	enable-method = "psci";
-};
-
-&cpu0_opp_table {
-	clocks = <&cru PLL_APLL>;
-	leakage-scaling-sel = <0   254   25>;
-
-	opp-1800000000 {
-		opp-hz = /bits/ 64 <1800000000>;
-		opp-microvolt = <1350000>;
-		clock-latency-ns = <40000>;
-		status = "disabled";
-	};
 };
 
 &cpu1 {
@@ -422,7 +428,13 @@
 	compatible = "rockchip,rga2";
 	clocks = <&cru ACLK_RGA>, <&cru HCLK_RGA>, <&cru SCLK_RGA>;
 	clock-names = "aclk_rga", "hclk_rga", "clk_rga";
+	assigned-clocks = <&cru ACLK_RGA>, <&cru SCLK_RGA>;
+	assigned-clock-rates = <300000000>, <300000000>;
 	dma-coherent;
+};
+
+&uart2 {
+	status = "disabled";
 };
 
 &usb_otg {
@@ -435,6 +447,10 @@
 	reset-names = "otg_ahb", "otg_phy", "otg_controller";
 	/*0 - Normal, 1 - Force Host, 2 - Force Device*/
 	rockchip,usb-mode = <0>;
+};
+
+&video_phy {
+	status = "okay";
 };
 
 &pinctrl {

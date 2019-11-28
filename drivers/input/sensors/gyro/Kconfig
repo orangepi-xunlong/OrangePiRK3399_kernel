@@ -1,10 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0
 #
 # gyroscope drivers configuration
 #
 
 menuconfig GYROSCOPE_DEVICE
 	bool "gyroscope device support"
-	default y
+	default y	
 
 if GYROSCOPE_DEVICE
 
@@ -35,8 +36,4 @@ config GYRO_MPU6880
 config GYRO_LSM330
 	bool "gyroscope lsm330_gyro"
 	default y
-
-config GYRO_LSM6DS3
-       bool "gyroscope lsm6ds3_gyro"
-       default y
 endif

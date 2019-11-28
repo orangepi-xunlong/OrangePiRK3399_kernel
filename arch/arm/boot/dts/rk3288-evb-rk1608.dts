@@ -45,13 +45,10 @@
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/pwm/pwm.h>
 #include "rk3288.dtsi"
+#include "rk3288-linux.dtsi"
 
 / {
 	compatible = "rockchip,rk3288-evb-rk1608", "rockchip,rk3288";
-
-	chosen {
-		bootargs = "earlycon=uart8250,mmio32,0xff690000 swiotlb=1";
-	};
 
 	backlight: backlight {
 		compatible = "pwm-backlight";
@@ -401,6 +398,14 @@
 	};
 };
 
+&dsi0_in_vopl {
+	status = "okay";
+};
+
+&dsi0_in_vopb {
+	status = "disabled";
+};
+
 &emmc {
 	bus-width = <8>;
 	cap-mmc-highspeed;
@@ -616,6 +621,7 @@
 &io_domains {
 	status = "okay";
 
+	bb-supply = <&vcc_18>;
 	sdcard-supply = <&vccio_sd>;
 	wifi-supply = <&vcc_18>;
 };
@@ -708,6 +714,10 @@
 	status = "okay";
 };
 
+&route_dsi0 {
+	status = "okay";
+};
+
 &saradc {
 	vref-supply = <&vcc_18>;
 	status = "okay";
@@ -754,7 +764,6 @@
 };
 
 &tsadc {
-	rockchip,hw-tshut-mode = <0>; /* tshut mode 0:CRU 1:GPIO */
 	rockchip,hw-tshut-polarity = <0>; /* tshut polarity 0:LOW 1:HIGH */
 	status = "okay";
 };
@@ -762,10 +771,6 @@
 &uart0 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&uart0_xfer &uart0_cts>;
-	status = "okay";
-};
-
-&uart2 {
 	status = "okay";
 };
 

@@ -169,7 +169,7 @@ static struct dwc_otg_driver_module_params dwc_otg_module_params = {
 	.host_rx_fifo_size = -1,
 	.host_nperio_tx_fifo_size = -1,
 	.host_perio_tx_fifo_size = -1,
-	.max_transfer_size = -1,
+	.max_transfer_size = 131072,
 	.max_packet_count = -1,
 	.host_channels = -1,
 	.dev_endpoints = -1,
@@ -201,7 +201,7 @@ static struct dwc_otg_driver_module_params dwc_otg_module_params = {
 			     /* 15 */
 			     },
 	.thr_ctl = -1,
-	.tx_thr_length = -1,
+	.tx_thr_length = 16,
 	.rx_thr_length = -1,
 	.pti_enable = -1,
 	.mpi_enable = -1,
@@ -419,9 +419,11 @@ void dwc_otg_force_device(dwc_otg_core_if_t *core_if)
 static ssize_t force_usb_mode_show(struct device_driver *drv, char *buf)
 {
 	dwc_otg_device_t *otg_dev = g_otgdev;
-	dwc_otg_core_if_t *core_if = otg_dev->core_if;
 
-	return sprintf(buf, "%d\n", core_if->usb_mode);
+	if (!otg_dev)
+		return -EINVAL;
+
+	return sprintf(buf, "%d\n", otg_dev->core_if->usb_mode);
 }
 
 static ssize_t force_usb_mode_store(struct device_driver *drv, const char *buf,
@@ -511,8 +513,11 @@ static ssize_t dwc_otg_conn_en_show(struct device_driver *_drv, char *_buf)
 {
 
 	dwc_otg_device_t *otg_dev = g_otgdev;
-	dwc_otg_pcd_t *_pcd = otg_dev->pcd;
-	return sprintf(_buf, "%d\n", _pcd->conn_en);
+
+	if (!otg_dev)
+		return -EINVAL;
+
+	return sprintf(_buf, "%d\n", otg_dev->pcd->conn_en);
 
 }
 
@@ -521,10 +526,12 @@ static ssize_t dwc_otg_conn_en_store(struct device_driver *_drv,
 {
 	int enable = simple_strtoul(_buf, NULL, 10);
 	dwc_otg_device_t *otg_dev = g_otgdev;
-	dwc_otg_pcd_t *_pcd = otg_dev->pcd;
-	DWC_PRINTF("%s %d->%d\n", __func__, _pcd->conn_en, enable);
 
-	_pcd->conn_en = enable;
+	if (!otg_dev)
+		return -EINVAL;
+
+	DWC_PRINTF("%s %d->%d\n", __func__, otg_dev->pcd->conn_en, enable);
+	otg_dev->pcd->conn_en = enable;
 	return _count;
 }
 
@@ -544,9 +551,7 @@ int dwc_otg_usb_state(void)
 		/* op_state is A_HOST */
 		if (1 == otg_dev->core_if->op_state)
 			return 1;
-		/* op_state is B_PERIPHERAL */
-		else if (4 == otg_dev->core_if->op_state)
-			return 0;
+		/* op_state is B_PERIPHERAL or others */
 		else
 			return 0;
 	} else {
@@ -571,8 +576,11 @@ static DRIVER_ATTR(op_state, S_IRUGO, dwc_otg_op_state_show, NULL);
 static ssize_t vbus_status_show(struct device_driver *_drv, char *_buf)
 {
 	dwc_otg_device_t *otg_dev = g_otgdev;
-	dwc_otg_pcd_t *_pcd = otg_dev->pcd;
-	return sprintf(_buf, "%d\n", _pcd->vbus_status);
+
+	if (!otg_dev)
+		return -EINVAL;
+
+	return sprintf(_buf, "%d\n", otg_dev->pcd->vbus_status);
 }
 
 static DRIVER_ATTR(vbus_status, S_IRUGO, vbus_status_show, NULL);
@@ -1126,6 +1134,9 @@ static int host20_driver_probe(struct platform_device *_dev)
 		goto fail;
 	}
 
+	/* Initialize last_id */
+	dwc_otg_device->last_id = -1;
+
 	clk_set_rate(pldata->phyclk_480m, 480000000);
 	/*
 	 * Enable the global interrupt after all the interrupt
@@ -1466,6 +1477,16 @@ static int otg20_driver_probe(struct platform_device *_dev)
 		goto fail;
 	}
 
+	dwc_otg_device->core_if->high_bandwidth_en = of_property_read_bool(node,
+						"rockchip,high-bandwidth");
+
+	/*
+	 * If support high bandwidth endpoint, use 'Dedicated FIFO Mode
+	 * with Thresholding', and enable thresholding for isochronous IN
+	 * endpoints. Note: Thresholding is supported only in device mode.
+	 */
+	if (dwc_otg_device->core_if->high_bandwidth_en)
+		dwc_otg_module_params.thr_ctl = 2;
 	/*
 	 * Validate parameter values.
 	 */
@@ -1524,6 +1545,10 @@ static int otg20_driver_probe(struct platform_device *_dev)
 	dwc_otg_device->core_if->hc_halt_quirk =
 		of_property_read_bool(node, "rockchip,hc-halt-quirk");
 
+	/* usb pd off support */
+	dwc_otg_device->core_if->usb_pd_off =
+		of_property_read_bool(node, "rockchip,usb-pd-off");
+
 #ifndef DWC_HOST_ONLY
 	/*
 	 * Initialize the PCD
@@ -1546,6 +1571,9 @@ static int otg20_driver_probe(struct platform_device *_dev)
 		goto fail;
 	}
 #endif
+	/* Initialize last_id */
+	dwc_otg_device->last_id = -1;
+
 	/*
 	 * Enable the global interrupt after all the interrupt
 	 * handlers are installed if there is no ADP support else
@@ -1586,6 +1614,9 @@ static int dwc_otg_pm_suspend(struct device *dev)
 
 	dev_dbg(dev, "dwc_otg PM suspend\n");
 
+	if (dwc_otg_device->core_if->usb_pd_off)
+		cancel_delayed_work(&dwc_otg_device->pcd->check_id_work);
+
 	if (dwc_otg_device->core_if->op_state == B_PERIPHERAL)
 		return 0;
 
@@ -1603,6 +1634,11 @@ static int dwc_otg_pm_resume(struct device *dev)
 	dwc_otg_device = dev_get_platdata(dev);
 
 	dev_dbg(dev, "dwc_otg PM resume\n");
+
+	if (dwc_otg_device->core_if->usb_pd_off) {
+		dwc_otg_device->last_id = -1;
+		schedule_delayed_work(&dwc_otg_device->pcd->check_id_work, HZ);
+	}
 
 	if (dwc_otg_device->core_if->op_state == B_PERIPHERAL)
 		return 0;

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
 #
 # light and position sensor drivers configuration
 #
@@ -33,10 +34,6 @@ config LS_ISL29023
 	
 config LS_AP321XX
   bool "light sensor ap321xx"
-	default n
-
-config LS_PHOTORESISTOR	
-  bool "light sensor photoresistor"
 	default n
 
 config LS_US5152

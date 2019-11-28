@@ -59,6 +59,7 @@ enum sensor_id {
 	ACCEL_ID_MPU6500,
 	ACCEL_ID_LSM330,
 	ACCEL_ID_BMA2XX,
+	ACCEL_ID_STK8BAXX,
 	COMPASS_ID_ALL,
 	COMPASS_ID_AK8975,
 	COMPASS_ID_AK8963,
@@ -83,7 +84,6 @@ enum sensor_id {
 	GYRO_ID_MPU6500,
 	GYRO_ID_MPU6880,
 	GYRO_ID_LSM330,
-	GYRO_ID_LSM6DS3,
 	LIGHT_ID_ALL,
 	LIGHT_ID_CM3217,
 	LIGHT_ID_CM3218,
@@ -332,3 +332,4 @@ extern int sensor_tx_data_normal(struct i2c_client *client, char *buf, int num);
 extern int sensor_rx_data_normal(struct i2c_client *client, char *buf, int num);
 extern int sensor_write_reg_normal(struct i2c_client *client, char value);
 extern int sensor_read_reg_normal(struct i2c_client *client);
+

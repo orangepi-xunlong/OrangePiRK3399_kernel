@@ -77,25 +77,25 @@
 
 		opp-312000000 {
 			opp-hz = /bits/ 64 <312000000>;
-			opp-microvolt = <1075000>;
+			opp-microvolt = <1075000 1075000 1125000>;
 			clock-latency-ns = <40000>;
 			status = "disabled";
 		};
 		opp-504000000 {
 			opp-hz = /bits/ 64 <504000000>;
-			opp-microvolt = <1100000>;
+			opp-microvolt = <1100000 1100000 1125000>;
 			clock-latency-ns = <40000>;
 			status = "disabled";
 		};
 		opp-816000000 {
 			opp-hz = /bits/ 64 <816000000>;
-			opp-microvolt = <1125000>;
+			opp-microvolt = <1125000 1125000 1125000>;
 			clock-latency-ns = <40000>;
 			status = "disabled";
 		};
 		opp-1008000000 {
 			opp-hz = /bits/ 64 <1008000000>;
-			opp-microvolt = <1125000>;
+			opp-microvolt = <1125000 1125000 1125000>;
 			clock-latency-ns = <40000>;
 			status = "disabled";
 		};
@@ -273,6 +273,8 @@
 		dma-names = "tx", "rx";
 		clock-names = "i2s_hclk", "i2s_clk";
 		clocks = <&cru HCLK_I2S_8CH>, <&cru SCLK_I2S0>;
+		resets = <&cru SRST_I2S0>;
+		reset-names = "reset-m";
 		rockchip,playback-channels = <8>;
 		rockchip,capture-channels = <2>;
 		status = "disabled";
@@ -290,6 +292,8 @@
 		dma-names = "tx", "rx";
 		clock-names = "i2s_hclk", "i2s_clk";
 		clocks = <&cru HCLK_I2S0_2CH>, <&cru SCLK_I2S1>;
+		resets = <&cru SRST_I2S1>;
+		reset-names = "reset-m";
 		rockchip,playback-channels = <2>;
 		rockchip,capture-channels = <2>;
 		status = "disabled";
@@ -307,6 +311,8 @@
 		dma-names = "tx", "rx";
 		clock-names = "i2s_hclk", "i2s_clk";
 		clocks = <&cru HCLK_I2S1_2CH>, <&cru SCLK_I2S2>;
+		resets = <&cru SRST_I2S2>;
+		reset-names = "reset-m";
 		rockchip,playback-channels = <2>;
 		rockchip,capture-channels = <2>;
 		status = "disabled";
@@ -802,22 +808,22 @@
 };
 
 &pwm0 {
-	pinctrl-names = "default";
+	pinctrl-names = "active";
 	pinctrl-0 = <&pwm0_out>;
 };
 
 &pwm1 {
-	pinctrl-names = "default";
+	pinctrl-names = "active";
 	pinctrl-0 = <&pwm1_out>;
 };
 
 &pwm2 {
-	pinctrl-names = "default";
+	pinctrl-names = "active";
 	pinctrl-0 = <&pwm2_out>;
 };
 
 &pwm3 {
-	pinctrl-names = "default";
+	pinctrl-names = "active";
 	pinctrl-0 = <&pwm3_out>;
 };
 

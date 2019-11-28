@@ -16,6 +16,7 @@
 #include <linux/i2c.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/of_gpio.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
 #include <linux/slab.h>
@@ -456,6 +457,8 @@ static int cw_get_voltage(struct cw_battery *cw_bat)
 		res1 = cw_bat->plat_data.divider_res1;
 		res2 = cw_bat->plat_data.divider_res2;
 		voltage = voltage * (res1 + res2) / res2;
+	} else if (cw_bat->dual_battery) {
+		voltage = voltage * 2;
 	}
 
 	dev_dbg(&cw_bat->client->dev, "the cw201x voltage=%d,reg_val=%x %x\n",
@@ -492,6 +495,8 @@ static void cw_update_charge_status(struct cw_battery *cw_bat)
 	if (cw_bat->charger_mode != cw_charger_mode) {
 		cw_bat->charger_mode = cw_charger_mode;
 		cw_bat->bat_change = 1;
+		if (cw_charger_mode)
+			cw_bat->charge_count++;
 	}
 }
 
@@ -512,10 +517,8 @@ static void cw_update_vol(struct cw_battery *cw_bat)
 	int ret;
 
 	ret = cw_get_voltage(cw_bat);
-	if ((ret >= 0) && (cw_bat->voltage != ret)) {
+	if ((ret >= 0) && (cw_bat->voltage != ret))
 		cw_bat->voltage = ret;
-		cw_bat->bat_change = 1;
-	}
 }
 
 static void cw_update_status(struct cw_battery *cw_bat)
@@ -643,6 +646,18 @@ static int cw_battery_get_property(struct power_supply *psy,
 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
 		break;
 
+	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
+		val->intval = cw_bat->charge_count;
+		break;
+
+	case POWER_SUPPLY_PROP_CHARGE_FULL:
+		val->intval = cw_bat->plat_data.design_capacity * 1000;
+		break;
+
+	case POWER_SUPPLY_PROP_TEMP:
+		val->intval = VIRTUAL_TEMPERATURE;
+		break;
+
 	default:
 		break;
 	}
@@ -657,6 +672,9 @@ static enum power_supply_property cw_battery_properties[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
+	POWER_SUPPLY_PROP_CHARGE_COUNTER,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_TEMP,
 };
 
 static const struct power_supply_desc cw2015_bat_desc = {
@@ -677,11 +695,48 @@ static int cw2015_parse_dt(struct cw_battery *cw_bat)
 	u32 value;
 	int ret;
 	struct cw_bat_platform_data *data = &cw_bat->plat_data;
+	struct gpio_desc *hw_id0_io;
+	struct gpio_desc *hw_id1_io;
+	int hw_id0_val;
+	int hw_id1_val;
 
 	if (!node)
 		return -ENODEV;
 
 	memset(data, 0, sizeof(*data));
+
+	ret = of_property_read_u32(node, "hw_id_check", &value);
+	if (!ret && value) {
+		hw_id0_io = gpiod_get_optional(dev, "hw-id0", GPIOD_IN);
+		if (!hw_id0_io)
+			return -EINVAL;
+		if (IS_ERR(hw_id0_io))
+			return PTR_ERR(hw_id0_io);
+
+		hw_id0_val = gpiod_get_value(hw_id0_io);
+		gpiod_put(hw_id0_io);
+
+		hw_id1_io = gpiod_get_optional(dev, "hw-id1", GPIOD_IN);
+		if (!hw_id1_io)
+			return -EINVAL;
+		if (IS_ERR(hw_id1_io))
+			return PTR_ERR(hw_id1_io);
+
+		hw_id1_val = gpiod_get_value(hw_id1_io);
+		gpiod_put(hw_id1_io);
+
+		/*
+		 * ID1 = 0, ID0 = 1 : Battery
+		 * ID1 = 1, ID0 = 0 : Dual Battery
+		 * ID1 = 0, ID0 = 0 : Adapter
+		 */
+		if (hw_id0_val == 1 && hw_id1_val == 0)
+			cw_bat->dual_battery = false;
+		else if (hw_id0_val == 0 && hw_id1_val == 1)
+			cw_bat->dual_battery = true;
+		else
+			return -EINVAL;
+	}
 
 	/* determine the number of config info */
 	prop = of_find_property(node, "bat_config_info", &length);
@@ -727,6 +782,14 @@ static int cw2015_parse_dt(struct cw_battery *cw_bat)
 		dev_err(dev, "monitor_sec missing!\n");
 	else
 		cw_bat->monitor_sec = value * TIMER_MS_COUNTS;
+
+	ret = of_property_read_u32(node, "design_capacity", &value);
+	if (ret < 0) {
+		dev_err(dev, "design_capacity missing!\n");
+		data->design_capacity = 2000;
+	} else {
+		data->design_capacity = value;
+	}
 
 	return 0;
 }

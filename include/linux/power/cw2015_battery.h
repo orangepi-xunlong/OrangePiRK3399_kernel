@@ -84,6 +84,7 @@ struct cw_bat_platform_data {
 	int divider_res1;
 	int divider_res2;
 	u32 *cw_bat_config_info;
+	int design_capacity;
 };
 
 struct cw_battery {
@@ -111,6 +112,8 @@ struct cw_battery {
 	u32 monitor_sec;
 	u32 bat_mode;
 	int bat_change;
+	bool dual_battery;
+	int charge_count;
 };
 
 #endif

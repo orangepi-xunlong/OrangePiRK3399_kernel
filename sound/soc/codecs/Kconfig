@@ -94,7 +94,10 @@ config SND_SOC_ALL_CODECS
 	select SND_SOC_PCM512x_I2C if I2C
 	select SND_SOC_PCM512x_SPI if SPI_MASTER
 	select SND_SOC_RK1000 if I2C
+	select SND_SOC_RK3228
+	select SND_SOC_RK3308
 	select SND_SOC_RK3328
+	select SND_SOC_RK817 if I2C
 	select SND_SOC_RT286 if I2C
 	select SND_SOC_RT298 if I2C
 	select SND_SOC_RT5616 if I2C
@@ -438,6 +441,14 @@ config SND_SOC_CX20442
 config SND_SOC_CX2072X
 	tristate "CX2072X CODEC"
 
+config SND_SOC_CX20810
+	tristate "CX20810 is a voice capture ic."
+	depends on I2C
+	help
+	  Say Y here if you have a CX20810 ic and want to enable
+	  support for the built-in.
+	  If unsure, say N.
+
 config SND_SOC_JZ4740_CODEC
 	select REGMAP_MMIO
 	tristate
@@ -459,6 +470,9 @@ config SND_SOC_DA732X
 
 config SND_SOC_DA9055
 	tristate
+
+config SND_SOC_DUMMY_CODEC
+	tristate "dummy codec"
 
 config SND_SOC_DW_HDMI_AUDIO
 	tristate "dw hdmi audio"
@@ -571,9 +585,22 @@ config SND_SOC_RK312X
 	select REGMAP_MMIO
 	tristate "Rockchip RK312X CODEC"
 
+config SND_SOC_RK3228
+	select REGMAP_MMIO
+	tristate "Rockchip RK3228 CODEC"
+
+config SND_SOC_RK3308
+	select REGMAP_MMIO
+	tristate "Rockchip RK3308 CODEC"
+
 config SND_SOC_RK3328
 	select REGMAP_MMIO
 	tristate "Rockchip RK3328 CODEC"
+
+config SND_SOC_RK817
+	tristate "Rockchip RK817 CODEC"
+	depends on MFD_RK808
+	select REGMAP_I2C
 
 config SND_SOC_RL6231
 	tristate
@@ -713,7 +740,7 @@ config SND_SOC_TAS5086
 	depends on I2C
 
 config SND_SOC_TAS571X
-	tristate "Texas Instruments TAS5711/TAS5717/TAS5719 power amplifiers"
+	tristate "Texas Instruments TAS5711/TAS5717/TAS5719/TAS5731 power amplifiers"
 	depends on I2C
 
 config SND_SOC_TC358749X

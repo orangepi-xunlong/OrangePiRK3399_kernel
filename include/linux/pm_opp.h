@@ -57,7 +57,9 @@ int dev_pm_opp_enable(struct device *dev, unsigned long freq);
 
 int dev_pm_opp_disable(struct device *dev, unsigned long freq);
 
-struct srcu_notifier_head *dev_pm_opp_get_notifier(struct device *dev);
+int dev_pm_opp_register_notifier(struct device *dev, struct notifier_block *nb);
+int dev_pm_opp_unregister_notifier(struct device *dev, struct notifier_block *nb);
+
 int dev_pm_opp_set_supported_hw(struct device *dev, const u32 *versions,
 				unsigned int count);
 void dev_pm_opp_put_supported_hw(struct device *dev);
@@ -66,7 +68,7 @@ void dev_pm_opp_put_prop_name(struct device *dev);
 int dev_pm_opp_set_regulator(struct device *dev, const char *name);
 void dev_pm_opp_put_regulator(struct device *dev);
 int dev_pm_opp_set_rate(struct device *dev, unsigned long target_freq);
-int dev_pm_opp_check_initial_rate(struct device *dev, unsigned long *cur_freq);
+int dev_pm_opp_check_rate_volt(struct device *dev, bool force);
 #else
 static inline unsigned long dev_pm_opp_get_voltage(struct dev_pm_opp *opp)
 {
@@ -146,10 +148,14 @@ static inline int dev_pm_opp_disable(struct device *dev, unsigned long freq)
 	return 0;
 }
 
-static inline struct srcu_notifier_head *dev_pm_opp_get_notifier(
-							struct device *dev)
+static inline int dev_pm_opp_register_notifier(struct device *dev, struct notifier_block *nb)
 {
-	return ERR_PTR(-EINVAL);
+	return -ENOTSUPP;
+}
+
+static inline int dev_pm_opp_unregister_notifier(struct device *dev, struct notifier_block *nb)
+{
+	return -ENOTSUPP;
 }
 
 static inline int dev_pm_opp_set_supported_hw(struct device *dev,
@@ -180,8 +186,7 @@ static inline int dev_pm_opp_set_rate(struct device *dev, unsigned long target_f
 	return -EINVAL;
 }
 
-static inline int dev_pm_opp_check_initial_rate(struct device *dev,
-						unsigned long *cur_freq)
+static inline int dev_pm_opp_check_rate_volt(struct device *dev, bool force)
 {
 	return -EINVAL;
 }

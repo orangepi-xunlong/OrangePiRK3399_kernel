@@ -20,6 +20,11 @@
 #include <linux/suspend.h>
 #include <linux/of.h>
 #include <linux/delay.h>
+#include <linux/nvmem-consumer.h>
+#include <linux/rockchip/cpu.h>
+#include <linux/soc/rockchip/pvtm.h>
+#include <linux/thermal.h>
+#include <soc/rockchip/rockchip_opp_select.h>
 
 #include "mali_kbase_rk.h"
 
@@ -50,6 +55,7 @@ static inline int rk_pm_enable_regulator(struct kbase_device *kbdev)
 {
 	return 0;
 }
+
 static inline void rk_pm_disable_regulator(struct kbase_device *kbdev)
 {
 }
@@ -85,6 +91,7 @@ static void rk_pm_power_off_delay_work(struct work_struct *work)
 
 	platform->is_powered = false;
 	KBASE_TIMELINE_GPU_POWER(kbdev, 0);
+	wake_unlock(&platform->wake_lock);
 }
 
 static int kbase_platform_rk_init(struct kbase_device *kbdev)
@@ -109,21 +116,30 @@ static int kbase_platform_rk_init(struct kbase_device *kbdev)
 	platform->power_off_wq = create_freezable_workqueue("gpu_power_off_wq");
 	if (!platform->power_off_wq) {
 		E("couldn't create workqueue");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto err_wq;
 	}
 	INIT_DEFERRABLE_WORK(&platform->work, rk_pm_power_off_delay_work);
+
+	wake_lock_init(&platform->wake_lock, WAKE_LOCK_SUSPEND, "gpu");
+
 	platform->utilisation_period = DEFAULT_UTILISATION_PERIOD_IN_MS;
 
 	ret = kbase_platform_rk_create_sysfs_files(kbdev->dev);
 	if (ret) {
 		E("fail to create sysfs_files. ret = %d.", ret);
-		goto EXIT;
+		goto err_sysfs_files;
 	}
 
 	kbdev->platform_context = (void *)platform;
 	pm_runtime_enable(kbdev->dev);
 
-EXIT:
+	return 0;
+
+err_sysfs_files:
+	wake_lock_destroy(&platform->wake_lock);
+	destroy_workqueue(platform->power_off_wq);
+err_wq:
 	return ret;
 }
 
@@ -136,6 +152,8 @@ static void kbase_platform_rk_term(struct kbase_device *kbdev)
 	kbdev->platform_context = NULL;
 
 	if (platform) {
+		cancel_delayed_work_sync(&platform->work);
+		wake_lock_destroy(&platform->wake_lock);
 		destroy_workqueue(platform->power_off_wq);
 		platform->is_powered = false;
 		platform->kbdev = NULL;
@@ -204,6 +222,7 @@ static int rk_pm_callback_power_on(struct kbase_device *kbdev)
 
 	platform->is_powered = true;
 	KBASE_TIMELINE_GPU_POWER(kbdev, 1);
+	wake_lock(&platform->wake_lock);
 
 	return ret;
 }
@@ -410,4 +429,57 @@ static void kbase_platform_rk_remove_sysfs_files(struct device *dev)
 {
 	device_remove_file(dev, &dev_attr_utilisation_period);
 	device_remove_file(dev, &dev_attr_utilisation);
+}
+
+static int rk3288_get_soc_info(struct device *dev, struct device_node *np,
+			       int *bin, int *process)
+{
+	int ret = -EINVAL, value = -EINVAL;
+	char *name;
+
+	if (!bin)
+		goto out;
+
+	if (soc_is_rk3288w())
+		name = "performance-w";
+	else
+		name = "performance";
+	if (of_property_match_string(np, "nvmem-cell-names", name) >= 0) {
+		ret = rockchip_get_efuse_value(np, name, &value);
+		if (ret) {
+			dev_err(dev, "Failed to get soc performance value\n");
+			goto out;
+		}
+		if (value & 0x2)
+			*bin = 3;
+		else if (value & 0x01)
+			*bin = 2;
+		else
+			*bin = 0;
+	} else {
+		dev_err(dev, "Failed to get bin config\n");
+	}
+	if (*bin >= 0)
+		dev_info(dev, "bin=%d\n", *bin);
+
+out:
+	return ret;
+}
+
+static const struct of_device_id rockchip_mali_of_match[] = {
+	{
+		.compatible = "rockchip,rk3288",
+		.data = (void *)&rk3288_get_soc_info,
+	},
+	{
+		.compatible = "rockchip,rk3288w",
+		.data = (void *)&rk3288_get_soc_info,
+	},
+	{},
+};
+
+int kbase_platform_rk_init_opp_table(struct kbase_device *kbdev)
+{
+	return rockchip_init_opp_table(kbdev->dev, rockchip_mali_of_match,
+				       "gpu_leakage", "mali");
 }

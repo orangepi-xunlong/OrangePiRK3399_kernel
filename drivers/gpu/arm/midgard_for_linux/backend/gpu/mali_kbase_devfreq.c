@@ -19,6 +19,7 @@
 
 
 #include <mali_kbase.h>
+#include <mali_kbase_tlstream.h>
 #include <mali_kbase_config_defaults.h>
 #include <backend/gpu/mali_kbase_pm_internal.h>
 #ifdef CONFIG_DEVFREQ_THERMAL
@@ -45,7 +46,16 @@
 #define dev_pm_opp_get_opp_count opp_get_opp_count
 #define dev_pm_opp_find_freq_ceil opp_find_freq_ceil
 #endif /* Linux >= 3.13 */
+#include <soc/rockchip/rockchip_opp_select.h>
+#include <soc/rockchip/rockchip_system_monitor.h>
 
+static struct devfreq_simple_ondemand_data ondemand_data;
+
+static struct monitor_dev_profile mali_mdevp = {
+	.type = MONITOR_TPYE_DEV,
+	.low_temp_adjust = rockchip_monitor_dev_low_temp_adjust,
+	.high_temp_adjust = rockchip_monitor_dev_high_temp_adjust,
+};
 
 static int
 kbase_devfreq_target(struct device *dev, unsigned long *target_freq, u32 flags)
@@ -53,6 +63,7 @@ kbase_devfreq_target(struct device *dev, unsigned long *target_freq, u32 flags)
 	struct kbase_device *kbdev = dev_get_drvdata(dev);
 	struct dev_pm_opp *opp;
 	unsigned long freq = 0;
+	unsigned long old_freq = kbdev->current_freq;
 	unsigned long voltage;
 	int err;
 
@@ -60,25 +71,36 @@ kbase_devfreq_target(struct device *dev, unsigned long *target_freq, u32 flags)
 
 	rcu_read_lock();
 	opp = devfreq_recommended_opp(dev, &freq, flags);
-	voltage = dev_pm_opp_get_voltage(opp);
-	rcu_read_unlock();
-	if (IS_ERR_OR_NULL(opp)) {
+	if (IS_ERR(opp)) {
+		rcu_read_unlock();
 		dev_err(dev, "Failed to get opp (%ld)\n", PTR_ERR(opp));
 		return PTR_ERR(opp);
 	}
+	voltage = dev_pm_opp_get_voltage(opp);
+	rcu_read_unlock();
 
 	/*
 	 * Only update if there is a change of frequency
 	 */
-	if (kbdev->current_freq == freq) {
+	if (old_freq == freq) {
 		*target_freq = freq;
+#ifdef CONFIG_REGULATOR
+		if (kbdev->current_voltage == voltage)
+			return 0;
+		err = regulator_set_voltage(kbdev->regulator, voltage, INT_MAX);
+		if (err) {
+			dev_err(dev, "Failed to set voltage (%d)\n", err);
+			return err;
+		}
+#else
 		return 0;
+#endif
 	}
 
 #ifdef CONFIG_REGULATOR
-	if (kbdev->regulator && kbdev->current_voltage != voltage
-			&& kbdev->current_freq < freq) {
-		err = regulator_set_voltage(kbdev->regulator, voltage, voltage);
+	if (kbdev->regulator && kbdev->current_voltage != voltage &&
+	    old_freq < freq) {
+		err = regulator_set_voltage(kbdev->regulator, voltage, INT_MAX);
 		if (err) {
 			dev_err(dev, "Failed to increase voltage (%d)\n", err);
 			return err;
@@ -92,11 +114,14 @@ kbase_devfreq_target(struct device *dev, unsigned long *target_freq, u32 flags)
 				freq, *target_freq);
 		return err;
 	}
-
+	*target_freq = freq;
+	kbdev->current_freq = freq;
+	if (kbdev->devfreq)
+		kbdev->devfreq->last_status.current_frequency = freq;
 #ifdef CONFIG_REGULATOR
-	if (kbdev->regulator && kbdev->current_voltage != voltage
-			&& kbdev->current_freq > freq) {
-		err = regulator_set_voltage(kbdev->regulator, voltage, voltage);
+	if (kbdev->regulator && kbdev->current_voltage != voltage &&
+	    old_freq > freq) {
+		err = regulator_set_voltage(kbdev->regulator, voltage, INT_MAX);
 		if (err) {
 			dev_err(dev, "Failed to decrease voltage (%d)\n", err);
 			return err;
@@ -104,9 +129,9 @@ kbase_devfreq_target(struct device *dev, unsigned long *target_freq, u32 flags)
 	}
 #endif
 
-	*target_freq = freq;
 	kbdev->current_voltage = voltage;
-	kbdev->current_freq = freq;
+
+	kbase_tlstream_aux_devfreq_target((u64)freq);
 
 	kbase_pm_reset_dvfs_utilisation(kbdev);
 
@@ -202,13 +227,20 @@ static void kbase_devfreq_exit(struct device *dev)
 
 int kbase_devfreq_init(struct kbase_device *kbdev)
 {
+	struct device_node *np = kbdev->dev->of_node;
 	struct devfreq_dev_profile *dp;
+	unsigned long opp_rate;
 	int err;
 
 	if (!kbdev->clock)
 		return -ENODEV;
 
 	kbdev->current_freq = clk_get_rate(kbdev->clock);
+#ifdef CONFIG_REGULATOR
+	if (kbdev->regulator)
+		kbdev->current_voltage =
+			regulator_get_voltage(kbdev->regulator);
+#endif
 
 	dp = &kbdev->devfreq_profile;
 
@@ -223,14 +255,13 @@ int kbase_devfreq_init(struct kbase_device *kbdev)
 	if (kbase_devfreq_init_freq_table(kbdev, dp))
 		return -EFAULT;
 
-	of_property_read_u32(kbdev->dev->of_node, "upthreshold",
-			     &kbdev->ondemand_data.upthreshold);
-	of_property_read_u32(kbdev->dev->of_node, "downdifferential",
-			     &kbdev->ondemand_data.downdifferential);
+	of_property_read_u32(np, "upthreshold",
+			     &ondemand_data.upthreshold);
+	of_property_read_u32(np, "downdifferential",
+			     &ondemand_data.downdifferential);
 
 	kbdev->devfreq = devfreq_add_device(kbdev->dev, dp,
-				"simple_ondemand",
-				&kbdev->ondemand_data);
+				"simple_ondemand", &ondemand_data);
 	if (IS_ERR(kbdev->devfreq)) {
 		kbase_devfreq_term_freq_table(kbdev);
 		return PTR_ERR(kbdev->devfreq);
@@ -243,6 +274,19 @@ int kbase_devfreq_init(struct kbase_device *kbdev)
 		goto opp_notifier_failed;
 	}
 
+	opp_rate = kbdev->current_freq;
+	rcu_read_lock();
+	devfreq_recommended_opp(kbdev->dev, &opp_rate, 0);
+	rcu_read_unlock();
+	kbdev->devfreq->last_status.current_frequency = opp_rate;
+
+	mali_mdevp.data = kbdev->devfreq;
+	kbdev->mdev_info = rockchip_system_monitor_register(kbdev->dev,
+							    &mali_mdevp);
+	if (IS_ERR(kbdev->mdev_info)) {
+		dev_dbg(kbdev->dev, "without system monitor\n");
+		kbdev->mdev_info = NULL;
+	}
 #ifdef CONFIG_DEVFREQ_THERMAL
 	err = kbase_power_model_simple_init(kbdev);
 	if (err && err != -ENODEV && err != -EPROBE_DEFER) {
@@ -292,6 +336,7 @@ void kbase_devfreq_term(struct kbase_device *kbdev)
 
 	dev_dbg(kbdev->dev, "Term Mali devfreq\n");
 
+	rockchip_system_monitor_unregister(kbdev->mdev_info);
 #ifdef CONFIG_DEVFREQ_THERMAL
 	if (kbdev->devfreq_cooling)
 		devfreq_cooling_unregister(kbdev->devfreq_cooling);

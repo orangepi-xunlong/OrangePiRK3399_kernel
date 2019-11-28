@@ -40,6 +40,7 @@
 
 /dts-v1/;
 #include "rk3288-evb.dtsi"
+#include "rk3288-linux.dtsi"
 
 / {
 	compatible = "rockchip,rk3288-evb-rk808-linux", "rockchip,rk3288";
@@ -86,6 +87,44 @@
 		pwms = <&pwm0 0 1000000 PWM_POLARITY_INVERTED>;
 	};
 
+	adc-keys {
+		compatible = "adc-keys";
+		io-channels = <&saradc 1>;
+		io-channel-names = "buttons";
+		poll-interval = <100>;
+		keyup-threshold-microvolt = <1800000>;
+
+		button-up {
+			label = "Volume Up";
+			linux,code = <KEY_VOLUMEUP>;
+			press-threshold-microvolt = <18000>;
+		};
+
+		button-down {
+			label = "Volume Down";
+			linux,code = <KEY_VOLUMEDOWN>;
+			press-threshold-microvolt = <300000>;
+		};
+
+		menu {
+			label = "Menu";
+			linux,code = <KEY_MENU>;
+			press-threshold-microvolt = <640000>;
+		};
+
+		esc {
+			label = "Esc";
+			linux,code = <KEY_ESC>;
+			press-threshold-microvolt = <1000000>;
+		};
+
+		home  {
+			label = "Home";
+			linux,code = <KEY_HOME>;
+			press-threshold-microvolt = <1300000>;
+		};
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 		#address-cells = <1>;
@@ -127,10 +166,91 @@
 	};
 
 	/delete-node/ sdmmc-regulator;
+
+	vcc18_dvp: vcc18-dvp {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc18_dvp";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		gpio = <&gpio0 RK_PC1 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-always-on;
+		vin-supply = <&vcc_io>;
+	};
+
+	vdd_log: vdd-logic {
+		compatible = "pwm-regulator";
+		rockchip,pwm_id = <1>;
+		rockchip,pwm_voltage = <1100000>;
+		pwms = <&pwm1 0 25000 1>;
+		regulator-name = "vcc_log";
+		regulator-min-microvolt = <860000>;
+		regulator-max-microvolt = <1360000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	xin32k: xin32k {
+		compatible = "fixed-clock";
+		clock-frequency = <32768>;
+		clock-output-names = "xin32k";
+		#clock-cells = <0>;
+	};
+};
+
+&cif {
+	status = "okay";
+	port {
+		/* Parallel bus endpoint */
+		/* cif_para_in: endpoint {
+		 *	remote-endpoint = <&cam_para_out1>;
+		 *	bus-width = <8>;
+		 *	hsync-active = <1>;
+		 *	vsync-active = <0>;
+		 * };
+		 */
+
+		/* MIPI CSI-2 endpoint */
+		cif_mipi_in: endpoint {
+			remote-endpoint = <&csi_host_output>;
+		};
+	};
 };
 
 &cpu0 {
 	cpu0-supply = <&vdd_cpu>;
+};
+
+&csi_host {
+	status = "okay";
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			csi_host_input: endpoint {
+				remote-endpoint = <&dphy_txrx1_out>;
+				data-lanes = <1>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			csi_host_output: endpoint {
+				remote-endpoint = <&cif_mipi_in>;
+			};
+		};
+	};
+};
+
+&dfi {
+	status = "okay";
+};
+
+&dmc {
+	center-supply = <&vdd_log>;
+	status = "okay";
 };
 
 &edp {
@@ -140,7 +260,6 @@
 &edp_panel {
 	compatible ="lg,lp079qx1-sp0v", "simple-panel";
 	backlight = <&backlight>;
-	enable-gpios = <&gpio7 4 GPIO_ACTIVE_HIGH>;
 	enable-delay-ms = <120>;
 	pinctrl-0 = <&lcd_cs>;
 	power-supply = <&vcc_lcd>;
@@ -156,6 +275,10 @@
 	mali-supply = <&vdd_gpu>;
 };
 
+&hdmi {
+	pinctrl-0 = <&hdmi_ddc>, <&hdmi_cec>;
+};
+
 &i2c0 {
 	clock-frequency = <400000>;
 
@@ -169,7 +292,7 @@
 		rockchip,system-power-controller;
 		wakeup-source;
 		#clock-cells = <1>;
-		clock-output-names = "xin32k", "rk808-clkout2";
+		clock-output-names = "rk808-clkout1", "rk808-clkout2";
 
 		vcc1-supply = <&vcc_sys>;
 		vcc2-supply = <&vcc_sys>;
@@ -399,7 +522,7 @@
 	status = "okay";
 	audio-supply = <&vcc_io>;
 	bb-supply = <&vcc_io>;
-	dvp-supply = <&vcc_io>;
+	dvp-supply = <&vcc18_dvp>;
 	flash0-supply = <&vcc_18>;
 	flash1-supply = <&vcc_io>;
 	gpio30-supply = <&vcc_io>;
@@ -411,9 +534,162 @@
 
 &i2c3 {
 	status = "okay";
+
+	vm149c: vm149c@0c {
+		compatible = "silicon touch,vm149c";
+		status = "okay";
+		reg = <0x0c>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+	};
+
+	gc2145: gc2145@3c {
+		status = "okay";
+		compatible = "galaxycore,gc2145";
+		reg = <0x3c>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cif_dvp_d2d9>;
+
+		/* reset-gpios = <&gpio7 5 GPIO_ACTIVE_LOW>; */
+
+		/* pwdn gpio:
+		 * for cam_para_out1: <&gpio2 14 GPIO_ACTIVE_HIGHT>
+		 * for cam_mipi_out1(txrx1): <&gpio7 4 GPIO_ACTIVE_HIGH>
+		 */
+		pwdn-gpios = <&gpio7 4 GPIO_ACTIVE_HIGH>;
+		rockchip,camera-module-index = <1>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "CMK-OT1055-FG1";
+		rockchip,camera-module-lens-name = "NC";
+
+		clocks = <&cru SCLK_VIP_OUT>;
+		clock-names = "xvclk";
+
+		port {
+			/* Parallel bus endpoint */
+			/* cam_para_out1: endpoint {
+			 *	remote-endpoint = <&cif_para_in>;
+			 *	bus-width = <8>;
+			 *	hsync-active = <1>;
+			 *	vsync-active = <0>;
+			 * };
+			 */
+
+			/* MIPI CSI-2 endpoint */
+			cam_mipi_out1: endpoint {
+				remote-endpoint = <&mipi_sensor_input>;
+				data-lanes = <1>;
+				clock-lanes = <0>;
+				clock-noncontinuous;
+			};
+		};
+	};
+
+	ov13850: ov13850@10 {
+		compatible = "ovti,ov13850";
+		status = "okay";
+		reg = <0x10>;
+		clocks = <&cru SCLK_VIP_OUT>;
+		clock-names = "xvclk";
+
+		reset-gpios = <&gpio7 21 GPIO_ACTIVE_HIGH>;
+		pwdn-gpios = <&gpio2 15 GPIO_ACTIVE_HIGH>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "CMK-CT0116";
+		rockchip,camera-module-lens-name = "Largan-50013A1";
+		lens-focus = <&vm149c>;
+
+		port {
+			cam_out: endpoint {
+				remote-endpoint = <&mipi_in_cam>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+};
+
+&isp_mmu {
+	status = "okay";
+};
+
+&mipi_phy_rx0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+
+			mipi_in_cam: endpoint {
+				remote-endpoint = <&cam_out>;
+				data-lanes = <1 2>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+
+			dphy_rx0_out: endpoint {
+				remote-endpoint = <&isp_mipi_in>;
+			};
+		};
+	};
+};
+
+&mipi_phy_tx1rx1 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			mipi_sensor_input: endpoint {
+				remote-endpoint = <&cam_mipi_out1>;
+				data-lanes = <1>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dphy_txrx1_out: endpoint {
+				remote-endpoint = <&csi_host_input>;
+			};
+		};
+	};
 };
 
 &rga {
+	status = "okay";
+};
+
+&rkisp1 {
+	status = "okay";
+
+	port {
+		isp_mipi_in: endpoint {
+			remote-endpoint = <&dphy_rx0_out>;
+		};
+	};
+};
+
+&rockchip_suspend {
+	rockchip,pwm-regulator-config = <
+	(0
+	| PWM1_REGULATOR_EN
+	)
+	>;
+};
+
+&route_edp {
+	status = "okay";
+};
+
+&route_hdmi {
 	status = "okay";
 };
 
@@ -421,7 +697,7 @@
 	status = "okay";
 };
 
-&uart2 {
+&pwm1 {
 	status = "okay";
 };
 
