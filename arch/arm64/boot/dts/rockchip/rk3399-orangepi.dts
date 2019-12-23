@@ -969,7 +969,7 @@
 	status = "okay";
 	ep-gpios = <&gpio2 4 GPIO_ACTIVE_HIGH>;
 	num-lanes = <4>;
-	max-link-speed = <2>;
+	max-link-speed = <1>;
 };
 
 &pwm_bl {
