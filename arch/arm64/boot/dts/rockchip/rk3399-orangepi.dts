@@ -600,7 +600,7 @@
 };
 */
 &route_dsi {
-	status = "okay";
+	status = "disable";
 	logo,mode = "center";
 };
 
