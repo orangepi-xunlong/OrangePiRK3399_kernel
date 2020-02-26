@@ -104,6 +104,10 @@
 	vbus-5v-gpios = <&gpio1 3 GPIO_ACTIVE_HIGH>;
 };
 
+&hdmi {
+	ddc-i2c-bus = <&i2c3>;
+};
+
 
 &pinctrl {
 	pcie {
