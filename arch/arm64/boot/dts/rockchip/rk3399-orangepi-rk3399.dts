@@ -44,7 +44,7 @@
 #include "rk3399-orangepi-common.dtsi"
 
 //#include "rk3399-orangepi-rkisp1.dtsi"
-//#include "rk3399-orangepi-lcd.dtsi"
+#include "rk3399-orangepi-lcd.dtsi"
 
 / {
 	model = "OrangePi RK3399";
@@ -196,6 +196,21 @@
         status = "okay";
 };
 
+&dsi {
+	status = "okay";
+	/delete-property/enable-gpios;
+	/delete-property/reset-gpios;
+	panel@1 {
+		enable-gpios = <&gpio1 13 GPIO_ACTIVE_HIGH>;
+                reset-gpios = <&gpio4 30 GPIO_ACTIVE_LOW>;
+	};
+};
+
+&gt9xx_1 {
+	status = "okay";
+	touch-gpio = <&gpio1 20 IRQ_TYPE_LEVEL_LOW>;
+        reset-gpio = <&gpio0 12 GPIO_ACTIVE_HIGH>;
+};
 
 &pinctrl {
 	pcie {
