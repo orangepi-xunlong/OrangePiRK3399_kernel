@@ -77,6 +77,24 @@
                 clock-output-names = "CLK_CAMERA_27MHZ";
                 #clock-cells = <0>;
         };
+
+        spdif_sound: spdif-sound {
+                status = "okay";
+                compatible = "simple-audio-card";
+                simple-audio-card,name = "ROCKCHIP,SPDIF";
+                simple-audio-card,cpu {
+                        sound-dai = <&spdif>;
+                };
+                simple-audio-card,codec {
+                        sound-dai = <&spdif_out>;
+                };
+        };
+
+        spdif_out: spdif-out {
+                status = "okay";
+                compatible = "linux,spdif-dit";
+                #sound-dai-cells = <0>;
+        };
 };
 
 &i2s0 {
@@ -85,11 +103,6 @@
         rockchip,playback-channels = <8>;
         rockchip,capture-channels = <8>;
         #sound-dai-cells = <0>;
-};
-
-&i2s1 {
-        assigned-clocks = <&cru SCLK_I2S1_DIV>;
-        assigned-clock-parents = <&cru PLL_GPLL>;
 };
 
 &rt5651_card {
@@ -323,6 +336,14 @@
 
 &i2c7 {
 	status = "disabled";
+};
+
+&spdif {
+        status = "okay";
+        pinctrl-0 = <&spdif_bus>;
+        i2c-scl-rising-time-ns = <450>;
+        i2c-scl-falling-time-ns = <15>;
+        #sound-dai-cells = <0>;
 };
 
 &pinctrl {
