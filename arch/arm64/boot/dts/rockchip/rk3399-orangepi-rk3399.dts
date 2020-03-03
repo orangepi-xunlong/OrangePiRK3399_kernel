@@ -70,6 +70,13 @@
 		regulator-name = "vcc5v0_host";
 		regulator-always-on;
 	};
+
+        ext_cam_clk: external-camera-clock {
+                compatible = "fixed-clock";
+                clock-frequency = <27000000>;
+                clock-output-names = "CLK_CAMERA_27MHZ";
+                #clock-cells = <0>;
+        };
 };
 
 &i2s0 {
@@ -117,7 +124,33 @@
                 rockchip,camera-module-index = <0>;
                 rockchip,camera-module-facing = "back";
         };
+/*
+        ov13850_0: ov13850@11 {
+                compatible = "ovti,ov13850";
+                status = "okay";
+                reg = <0x10>;
+                clocks = <&cru SCLK_CIF_OUT>;
+                clock-names = "xvclk";
 
+                pwr-gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
+                reset-gpios = <&gpio0 8 GPIO_ACTIVE_HIGH>;
+                pwdn-gpios = <&gpio2 27 GPIO_ACTIVE_HIGH>;
+                pinctrl-names = "rockchip,camera_default";
+                pinctrl-0 = <&cif_clkout>;
+                rockchip,camera-module-index = <0>;
+                rockchip,camera-module-facing = "back";
+                rockchip,camera-module-name = "CMK-CT0116";
+                rockchip,camera-module-lens-name = "Largan-50013A1";
+//              lens-focus = <&vm149c_1>;
+
+                port {
+                        ucam_out0: endpoint {
+                                remote-endpoint = <&mipi_in_ucam0>;
+                                data-lanes = <1 2>;
+                        };
+                };
+        };
+*/
         ov13850: ov13850@10 {
                 compatible = "ovti,ov13850";
                 status = "okay";
@@ -125,7 +158,6 @@
                 clocks = <&cru SCLK_CIF_OUT>;
                 clock-names = "xvclk";
 
-                /* conflict with csi-ctl-gpios */
                 pwr-gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
                 reset-gpios = <&gpio0 8 GPIO_ACTIVE_HIGH>;
                 pwdn-gpios = <&gpio2 28 GPIO_ACTIVE_HIGH>;
@@ -141,6 +173,65 @@
                         ucam_out1: endpoint {
                                 remote-endpoint = <&mipi_in_ucam1>;
                                 data-lanes = <1 2>;
+                        };
+                };
+        };
+
+	tc358749x: tc358749x@0f {
+                compatible = "toshiba,tc358749";
+                reg = <0x1f>;
+                clocks = <&ext_cam_clk>;
+                clock-names = "refclk";
+                reset-gpios = <&gpio2 7 GPIO_ACTIVE_LOW>;
+                interrupt-parent = <&gpio2>;
+                interrupts = <12 IRQ_TYPE_LEVEL_LOW>;
+                pinctrl-names = "default";
+                pinctrl-0 = <&hdmiin_gpios>;
+                rockchip,camera-module-index = <0>;
+                rockchip,camera-module-facing = "back";
+                rockchip,camera-module-name = "default";
+                rockchip,camera-module-lens-name = "default";
+                status = "okay";
+
+                port {
+                        hdmiin_out0: endpoint {
+                                remote-endpoint = <&mipi_in_ucam0>;
+                                data-lanes = <1 2 3 4>;
+                                clock-noncontinuous;
+                                link-frequencies = /bits/ 64 <297000000>;
+                        };
+                };
+        };
+
+};
+
+&mipi_dphy_rx0 {
+        status = "okay";
+
+        ports {
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                port@0 {
+                        reg = <0>;
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+
+                        mipi_in_ucam0: endpoint@1 {
+                                reg = <1>;
+                                remote-endpoint = <&hdmiin_out0>;
+                                data-lanes = <1 2 3 4>;
+                        };
+                };
+
+                port@1 {
+                        reg = <1>;
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+
+                        dphy_rx0_out: endpoint@0 {
+                                reg = <0>;
+                                remote-endpoint = <&isp0_mipi_in>;
                         };
                 };
         };
@@ -178,6 +269,21 @@
         };
 };
 
+&rkisp1_0 {
+        status = "okay";
+
+        port {
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                isp0_mipi_in: endpoint@0 {
+                        reg = <0>;
+                        remote-endpoint = <&dphy_rx0_out>;
+                };
+        };
+};
+
+
 &rkisp1_1 {
         status = "okay";
 
@@ -192,12 +298,12 @@
         };
 };
 
-&isp1_mmu {
+&isp0_mmu {
         status = "okay";
 };
 
 &dsi {
-	status = "okay";
+	status = "disabled";
 	/delete-property/enable-gpios;
 	/delete-property/reset-gpios;
 	panel@1 {
@@ -207,9 +313,16 @@
 };
 
 &gt9xx_1 {
-	status = "okay";
+	status = "disabled";
 	touch-gpio = <&gpio1 20 IRQ_TYPE_LEVEL_LOW>;
         reset-gpio = <&gpio0 12 GPIO_ACTIVE_HIGH>;
+};
+&isp1_mmu {
+        status = "okay";
+};
+
+&i2c7 {
+	status = "disabled";
 };
 
 &pinctrl {
@@ -225,5 +338,19 @@
 				<4 25 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
+
+        hdmiin {
+                hdmiin_gpios: hdmiin-gpios {
+                        rockchip,pins =
+                                <2 5 RK_FUNC_GPIO &pcfg_output_high>,
+                                <2 6 RK_FUNC_GPIO &pcfg_output_high>,
+                                <2 7 RK_FUNC_GPIO &pcfg_pull_none>,
+                                <2 8 RK_FUNC_GPIO &pcfg_output_high>,
+				<2 9 RK_FUNC_GPIO &pcfg_output_high>,
+				<2 10 RK_FUNC_GPIO &pcfg_output_low>,
+				<2 12 RK_FUNC_GPIO &pcfg_output_high>;
+                };
+        };
+
 
 };
